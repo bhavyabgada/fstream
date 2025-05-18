@@ -16,6 +16,7 @@ import { useAuth } from '../utils/AuthContext';
 const CreateChannelScreen = ({ navigation, route }) => {
   const { userInfo } = route.params;
   const [isLoading, setIsLoading] = useState(false);
+  const [isCheckingChannel, setIsCheckingChannel] = useState(false);
   const { updateProfile } = useAuth();
 
   const navigateToHome = () => {
@@ -94,15 +95,12 @@ const CreateChannelScreen = ({ navigation, route }) => {
   const openChannelCreation = async () => {
     setIsLoading(true);
     try {
-      // Check if the in-app browser is available
       const isAvailable = await InAppBrowser.isAvailable();
       if (!isAvailable) {
         throw new Error('In-app browser is not available');
       }
 
-      // Configure browser options for a native feel
       const options = {
-        // Show toolbar
         showTitle: true,
         toolbarColor: '#FF0000',
         secondaryToolbarColor: 'black',
@@ -111,56 +109,70 @@ const CreateChannelScreen = ({ navigation, route }) => {
         enableUrlBarHiding: true,
         enableDefaultShare: false,
         forceCloseOnRedirection: false,
-        // Specify animation (only on Android)
         animations: {
           startEnter: 'slide_in_right',
           startExit: 'slide_out_left',
           endEnter: 'slide_in_left',
           endExit: 'slide_out_right'
         },
-        // Additional headers to maintain Google sign-in state
         headers: {
           'Authorization': `Bearer ${userInfo.accessToken}`
         },
-        // Only on iOS
         preferredBarTintColor: '#FF0000',
         preferredControlTintColor: 'white',
         readerMode: false,
-        // Android only
         showInRecents: true,
-        // Force browser theme
         modalEnabled: true,
         modalPresentationStyle: 'pageSheet',
+        injectedJavaScript: `
+          (function() {
+            function closeAndCheck() {
+              window.ReactNativeWebView.postMessage('close_browser');
+            }
+
+            document.addEventListener('click', function(e) {
+              if (e.target && (
+                  e.target.matches('button[type="submit"]') || 
+                  e.target.matches('.create-channel-button') ||
+                  e.target.textContent.includes('Create') ||
+                  e.target.value.includes('Create')
+                )) {
+                console.log('Create button clicked');
+                closeAndCheck();
+              }
+            }, true);
+
+            document.addEventListener('submit', function(e) {
+              console.log('Form submitted');
+              closeAndCheck();
+            }, true);
+          })();
+        `,
+        onMessage: (event) => {
+          if (event.nativeEvent.data === 'close_browser') {
+            console.warn('[InAppBrowser] Closing browser immediately after button click');
+            InAppBrowser.close();
+            setTimeout(() => {
+              setIsCheckingChannel(true);
+              checkForChannel();
+            }, 1500);
+          }
+        }
       };
 
       console.warn('[Channel Creation] Opening YouTube channel creation page');
-      const result = await InAppBrowser.openAuth(
-        'https://www.youtube.com/create_channel',
+      
+      const channelCreationUrl = `https://m.youtube.com/create_channel?chromeless=1&next=/channel_creation_done&authuser=${userInfo.email}`;
+      
+      await InAppBrowser.openAuth(
+        channelCreationUrl,
         'streamverse://callback',
         options
       );
-
-      console.warn('[Channel Creation] Browser result:', result);
-
-      if (result.type === 'success') {
-        // Check for channel immediately after browser closes
-        const hasChannel = await checkForChannel();
-        if (!hasChannel) {
-          Alert.alert(
-            'Channel Not Found',
-            'Please complete the channel creation process.'
-          );
-        }
-      } else if (result.type === 'cancel') {
-        console.warn('[Channel Creation] User cancelled the process');
-      }
     } catch (error) {
       console.warn('[Channel Creation] Error:', error);
-      Alert.alert(
-        'Error',
-        'Failed to create channel. Please try again.'
-      );
     } finally {
+      setIsCheckingChannel(false);
       setIsLoading(false);
     }
   };
@@ -176,10 +188,15 @@ const CreateChannelScreen = ({ navigation, route }) => {
         <TouchableOpacity
           style={styles.createButton}
           onPress={openChannelCreation}
-          disabled={isLoading}
+          disabled={isLoading || isCheckingChannel}
         >
-          {isLoading ? (
-            <ActivityIndicator color="#FFF" />
+          {isLoading || isCheckingChannel ? (
+            <View style={styles.loadingContainer}>
+              <ActivityIndicator color="#FFF" />
+              <Text style={styles.loadingText}>
+                {isCheckingChannel ? 'Checking channel status...' : 'Creating channel...'}
+              </Text>
+            </View>
           ) : (
             <Text style={styles.createButtonText}>Create Channel</Text>
           )}
@@ -226,6 +243,17 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 18,
     fontWeight: 'bold',
+  },
+  loadingContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  loadingText: {
+    color: '#fff',
+    marginLeft: 8,
+    fontSize: 16,
+    fontWeight: '600',
   },
 });
 
