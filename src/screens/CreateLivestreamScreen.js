@@ -21,6 +21,7 @@ import {
 import MaterialIcons from 'react-native-vector-icons/MaterialIcons';
 import { Camera, useCameraDevices, CameraPermissionStatus } from 'react-native-vision-camera';
 import * as ImagePicker from 'react-native-image-picker';
+import { useAuth } from '../utils/AuthContext';
 
 // Screen dimensions for responsive UI
 const { width, height } = Dimensions.get('window');
@@ -51,6 +52,7 @@ const INITIAL_CHAT_MESSAGES = [
 ];
 
 const CreateLivestreamScreen = ({ navigation }) => {
+  const { user } = useAuth();
   // Livestream setup state
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -178,6 +180,10 @@ const CreateLivestreamScreen = ({ navigation }) => {
   const [isChatVisible, setIsChatVisible] = useState(false);
   const [chatMessages, setChatMessages] = useState(INITIAL_CHAT_MESSAGES);
   const [messageText, setMessageText] = useState('');
+  
+  const [streamKey, setStreamKey] = useState('');
+  const [streamUrl, setStreamUrl] = useState('');
+  const [broadcastId, setBroadcastId] = useState('');
   
   // Check if we're running on a simulator
   useEffect(() => {
@@ -322,48 +328,217 @@ const CreateLivestreamScreen = ({ navigation }) => {
     Linking.openSettings();
   };
   
-  // Start livestream
-  const startLivestream = () => {
+  // Create a YouTube livestream
+  const createYouTubeLivestream = async () => {
+    try {
+      console.warn('[YouTube API] Creating livestream broadcast');
+      
+      // 1. Create broadcast
+      const broadcastResponse = await fetch(
+        'https://www.googleapis.com/youtube/v3/liveBroadcasts?part=snippet,contentDetails,status',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${user.accessToken}`,
+          },
+          body: JSON.stringify({
+            snippet: {
+              title: title,
+              description: description || 'Join me for an exciting livestream!',
+              scheduledStartTime: new Date().toISOString(),
+            },
+            contentDetails: {
+              enableAutoStart: true,
+              enableAutoStop: true,
+              enableDvr: true,
+              enableContentEncryption: true,
+              enableEmbed: true,
+              recordFromStart: true,
+              startWithSlate: false,
+            },
+            status: {
+              privacyStatus: 'unlisted',
+              selfDeclaredMadeForKids: false,
+              enableModerationPanel: true,
+            },
+          }),
+        }
+      );
+
+      const broadcastData = await broadcastResponse.json();
+      console.warn('[YouTube API] Broadcast creation response:', JSON.stringify(broadcastData, null, 2));
+
+      if (!broadcastResponse.ok) {
+        throw new Error(broadcastData.error?.message || 'Failed to create broadcast');
+      }
+
+      const broadcastId = broadcastData.id;
+      setBroadcastId(broadcastId);
+
+      // 2. Create stream
+      console.warn('[YouTube API] Creating livestream');
+      const streamResponse = await fetch(
+        'https://www.googleapis.com/youtube/v3/liveStreams?part=snippet,cdn,status',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${user.accessToken}`,
+          },
+          body: JSON.stringify({
+            snippet: {
+              title: `${title} - Stream`,
+            },
+            cdn: {
+              frameRate: 'variable',
+              ingestionType: 'rtmp',
+              resolution: 'variable',
+            },
+          }),
+        }
+      );
+
+      const streamData = await streamResponse.json();
+      console.warn('[YouTube API] Stream creation response:', JSON.stringify(streamData, null, 2));
+
+      if (!streamResponse.ok) {
+        throw new Error(streamData.error?.message || 'Failed to create stream');
+      }
+
+      // Save stream details
+      setStreamKey(streamData.cdn.ingestionInfo.streamName);
+      setStreamUrl(streamData.cdn.ingestionInfo.ingestionAddress);
+
+      // 3. Bind broadcast to stream
+      console.warn('[YouTube API] Binding stream to broadcast');
+      const bindResponse = await fetch(
+        `https://www.googleapis.com/youtube/v3/liveBroadcasts/bind?id=${broadcastId}&streamId=${streamData.id}&part=snippet`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${user.accessToken}`,
+          },
+        }
+      );
+
+      const bindData = await bindResponse.json();
+      console.warn('[YouTube API] Bind response:', JSON.stringify(bindData, null, 2));
+
+      if (!bindResponse.ok) {
+        throw new Error(bindData.error?.message || 'Failed to bind stream to broadcast');
+      }
+
+      // 4. Set thumbnail if available
+      if (thumbnail && thumbnail !== 'https://images.pexels.com/photos/66134/pexels-photo-66134.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=2') {
+        console.warn('[YouTube API] Setting thumbnail');
+        const formData = new FormData();
+        formData.append('image', {
+          uri: thumbnail,
+          type: 'image/jpeg',
+          name: 'thumbnail.jpg',
+        });
+
+        const thumbnailResponse = await fetch(
+          `https://www.googleapis.com/youtube/v3/thumbnails/set?videoId=${broadcastId}`,
+          {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${user.accessToken}`,
+              'Content-Type': 'multipart/form-data',
+            },
+            body: formData,
+          }
+        );
+
+        console.warn('[YouTube API] Thumbnail upload response:', await thumbnailResponse.text());
+      }
+
+      return true;
+    } catch (error) {
+      console.warn('[YouTube API] Error creating livestream:', error);
+      Alert.alert('Error', error.message || 'Failed to create livestream');
+      return false;
+    }
+  };
+
+  // Start the livestream
+  const startLivestream = async () => {
     if (!title.trim()) {
       Alert.alert('Error', 'Please enter a title for your livestream');
       return;
     }
-    
+
     setIsLoading(true);
-    
-    // Simulate API call to create livestream
-    setTimeout(() => {
+    try {
+      const success = await createYouTubeLivestream();
+      if (success) {
+        setCurrentStep('preview');
+      }
+    } catch (error) {
+      console.warn('Error starting livestream:', error);
+      Alert.alert('Error', 'Failed to start livestream');
+    } finally {
       setIsLoading(false);
-      setCurrentStep('preview');
-    }, 1500);
+    }
   };
-  
+
   // Go live
-  const goLive = () => {
-    setIsLive(true);
-    setCurrentStep('live');
-  };
-  
-  // End livestream
-  const endLivestream = () => {
-    Alert.alert(
-      'End Livestream',
-      'Are you sure you want to end your livestream?',
-      [
+  const goLive = async () => {
+    try {
+      console.warn('[YouTube API] Transitioning broadcast to live');
+      const response = await fetch(
+        `https://www.googleapis.com/youtube/v3/liveBroadcasts/transition?broadcastStatus=live&id=${broadcastId}&part=status`,
         {
-          text: 'Cancel',
-          style: 'cancel',
-        },
-        {
-          text: 'End',
-          onPress: () => {
-            setIsLive(false);
-            navigation.navigate('Home');
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${user.accessToken}`,
           },
-          style: 'destructive',
-        },
-      ]
-    );
+        }
+      );
+
+      const data = await response.json();
+      console.warn('[YouTube API] Transition response:', JSON.stringify(data, null, 2));
+
+      if (!response.ok) {
+        throw new Error(data.error?.message || 'Failed to go live');
+      }
+
+      setIsLive(true);
+      setCurrentStep('live');
+    } catch (error) {
+      console.warn('[YouTube API] Error going live:', error);
+      Alert.alert('Error', 'Failed to go live');
+    }
+  };
+
+  // End the livestream
+  const endLivestream = async () => {
+    try {
+      console.warn('[YouTube API] Ending broadcast');
+      const response = await fetch(
+        `https://www.googleapis.com/youtube/v3/liveBroadcasts/transition?broadcastStatus=complete&id=${broadcastId}&part=status`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${user.accessToken}`,
+          },
+        }
+      );
+
+      const data = await response.json();
+      console.warn('[YouTube API] End broadcast response:', JSON.stringify(data, null, 2));
+
+      if (!response.ok) {
+        throw new Error(data.error?.message || 'Failed to end livestream');
+      }
+
+      setIsLive(false);
+      navigation.replace('Home');
+    } catch (error) {
+      console.warn('[YouTube API] Error ending livestream:', error);
+      Alert.alert('Error', 'Failed to end livestream');
+    }
   };
   
   // Render setup form
