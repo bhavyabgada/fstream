@@ -20,6 +20,7 @@ import VideoPlayerScreen from './src/screens/VideoPlayerScreen';
 import CreateLivestreamScreen from './src/screens/CreateLivestreamScreen';
 import LoginScreen from './src/screens/LoginScreen';
 import ProfileScreen from './src/screens/ProfileScreen';
+import CreateChannelScreen from './src/screens/CreateChannelScreen';
 
 // Ignore specific warnings
 LogBox.ignoreLogs([
@@ -102,14 +103,24 @@ const AppNavigator = () => {
         </>
       ) : (
         // Authentication screens
-        <Stack.Screen 
-          name="Login" 
-          component={LoginScreen} 
-          options={{ 
-            animationEnabled: true,
-            gestureEnabled: false,
-          }}
-        />
+        <>
+          <Stack.Screen 
+            name="Login" 
+            component={LoginScreen} 
+            options={{ 
+              animationEnabled: true,
+              gestureEnabled: false,
+            }}
+          />
+          <Stack.Screen 
+            name="CreateChannel" 
+            component={CreateChannelScreen} 
+            options={{ 
+              animationEnabled: true,
+              gestureEnabled: false,
+            }}
+          />
+        </>
       )}
     </Stack.Navigator>
   );
