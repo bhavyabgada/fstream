@@ -19,7 +19,8 @@ import {
   Dimensions,
 } from 'react-native';
 import MaterialIcons from 'react-native-vector-icons/MaterialIcons';
-import { Camera, useCameraDevices, CameraPermissionStatus } from 'react-native-vision-camera';
+import { Camera, useCameraDevice, useCameraPermission, useMicrophonePermission } from 'react-native-vision-camera';
+import { ApiVideoLiveStreamView } from '@api.video/react-native-livestream';
 import * as ImagePicker from 'react-native-image-picker';
 import { useAuth } from '../utils/AuthContext';
 
@@ -59,73 +60,34 @@ const CreateLivestreamScreen = ({ navigation }) => {
   const [thumbnail, setThumbnail] = useState('https://images.pexels.com/photos/66134/pexels-photo-66134.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=2');
   const [isLive, setIsLive] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [hasPermission, setHasPermission] = useState(null);
   const [simulatorFallback, setSimulatorFallback] = useState(false);
   
   // Camera state
   const [isFrontCamera, setIsFrontCamera] = useState(false);
   const [flash, setFlash] = useState('off');
-  const [cameraPermission, setCameraPermission] = useState();
-  const [microphonePermission, setMicrophonePermission] = useState();
   
-  const rawDevices = useCameraDevices();
+  // Livestream state
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamingError, setStreamingError] = useState(null);
+  const [streamQuality, setStreamQuality] = useState('720p'); // 480p, 720p, 1080p
+  const [streamBitrate, setStreamBitrate] = useState(2500); // kbps
+  const [rtmpUrl, setRtmpUrl] = useState('rtmp://broadcast.api.video/s'); // Default RTMP URL
+  const [streamStatus, setStreamStatus] = useState('inactive'); // inactive, active, error
+  const [isWaitingForStream, setIsWaitingForStream] = useState(false);
   
-  // Organize devices into front and back cameras
-  const devices = React.useMemo(() => {
-    if (!Array.isArray(rawDevices) || rawDevices.length === 0) {
-      console.log('No devices available');
-      return { front: undefined, back: undefined };
-    }
+  // Use the modern camera hooks
+  const { hasPermission: hasCameraPermission, requestPermission: requestCameraPermission } = useCameraPermission();
+  const { hasPermission: hasMicrophonePermission, requestPermission: requestMicrophonePermission } = useMicrophonePermission();
+  
+  // Refs for livestreaming
+  const liveStreamRef = useRef(null);
+  
+  // Get camera device using the modern API
+  const device = useCameraDevice(isFrontCamera ? 'front' : 'back');
 
-    // Find the best front and back cameras
-    const frontCamera = rawDevices.find(d => 
-      d.position === 'front' && d.name?.includes('TrueDepth')
-    );
-    
-    const backCamera = rawDevices.find(d => 
-      d.position === 'back' && (d.name?.includes('Back Camera') || d.name?.includes('Back Triple Camera'))
-    );
-
-    console.log('Organized devices:', {
-      frontCamera: frontCamera?.name,
-      backCamera: backCamera?.name
-    });
-
-    return {
-      front: frontCamera,
-      back: backCamera
-    };
-  }, [rawDevices]);
-
-  useEffect(() => {
-    console.log('Devices changed:', {
-      availableDevices: rawDevices?.length || 0,
-      frontDevice: devices.front?.name,
-      backDevice: devices.back?.name
-    });
-  }, [rawDevices, devices]);
-
-  const device = React.useMemo(() => {
-    if (!devices.front && !devices.back) {
-      console.log('No organized devices available');
-      return undefined;
-    }
-
-    console.log('Device selection:', {
-      selectedType: isFrontCamera ? 'front' : 'back',
-      frontAvailable: !!devices.front,
-      backAvailable: !!devices.back
-    });
-
-    const selectedDevice = isFrontCamera ? devices.front : devices.back;
-    console.log('Selected device:', selectedDevice ? {
-      id: selectedDevice.id,
-      name: selectedDevice.name,
-      position: selectedDevice.position
-    } : 'none');
-
-    return selectedDevice;
-  }, [devices, isFrontCamera]);
+  // Fallback device selection if primary device is not available
+  const fallbackDevice = useCameraDevice(isFrontCamera ? 'back' : 'front');
+  const selectedDevice = device || fallbackDevice;
 
   // Check permissions and initialize camera on mount
   useEffect(() => {
@@ -133,39 +95,89 @@ const CreateLivestreamScreen = ({ navigation }) => {
       try {
         console.log('Initializing camera...');
         
-        // Check initial permissions
-        const cameraStatus = await Camera.getCameraPermissionStatus();
-        const micStatus = await Camera.getMicrophonePermissionStatus();
-        
-        console.log('Initial permissions:', { camera: cameraStatus, microphone: micStatus });
-        
-        // Request permissions if needed
-        if (cameraStatus !== 'granted') {
-          const newCameraPermission = await Camera.requestCameraPermission();
-          console.log('New camera permission:', newCameraPermission);
-          setCameraPermission(newCameraPermission);
-        } else {
-          setCameraPermission(cameraStatus);
+        // Request camera permission if not granted
+        if (!hasCameraPermission) {
+          console.log('Requesting camera permission...');
+          const granted = await requestCameraPermission();
+          console.log('Camera permission result:', granted);
+          
+          if (!granted) {
+            console.warn('Camera permission denied');
+            Alert.alert(
+              'Camera Permission Required',
+              'Please enable camera access in Settings to use the livestream feature.',
+              [
+                { text: 'Cancel', style: 'cancel' },
+                { text: 'Open Settings', onPress: () => Linking.openSettings() }
+              ]
+            );
+            return;
+          }
         }
         
-        if (micStatus !== 'granted') {
-          const newMicPermission = await Camera.requestMicrophonePermission();
-          console.log('New microphone permission:', newMicPermission);
-          setMicrophonePermission(newMicPermission);
-        } else {
-          setMicrophonePermission(micStatus);
+        // Request microphone permission if not granted
+        if (!hasMicrophonePermission) {
+          console.log('Requesting microphone permission...');
+          const granted = await requestMicrophonePermission();
+          console.log('Microphone permission result:', granted);
+          
+          if (!granted) {
+            console.warn('Microphone permission denied');
+            Alert.alert(
+              'Microphone Permission Required',
+              'Please enable microphone access in Settings for audio in your livestream.',
+              [
+                { text: 'Cancel', style: 'cancel' },
+                { text: 'Open Settings', onPress: () => Linking.openSettings() }
+              ]
+            );
+          }
         }
 
-        // Force camera to initialize
-        await Camera.requestCameraPermission();
         console.log('Camera initialization completed');
       } catch (error) {
         console.error('Camera initialization error:', error);
+        Alert.alert(
+          'Camera Error',
+          'Failed to initialize camera. Please try again.',
+          [{ text: 'OK' }]
+        );
       }
     };
 
     initializeCamera();
-  }, []);
+  }, [hasCameraPermission, hasMicrophonePermission, requestCameraPermission, requestMicrophonePermission]);
+
+  // Log device information for debugging
+  useEffect(() => {
+    console.log('Camera device info:', {
+      requestedPosition: isFrontCamera ? 'front' : 'back',
+      primaryDevice: device ? {
+        id: device.id,
+        name: device.name,
+        position: device.position,
+        hasFlash: device.hasFlash,
+        hasTorch: device.hasTorch,
+        minZoom: device.minZoom,
+        maxZoom: device.maxZoom,
+        formats: device.formats?.length || 0,
+      } : 'No primary device available',
+      fallbackDevice: fallbackDevice ? {
+        id: fallbackDevice.id,
+        name: fallbackDevice.name,
+        position: fallbackDevice.position,
+      } : 'No fallback device available',
+      selectedDevice: selectedDevice ? {
+        id: selectedDevice.id,
+        name: selectedDevice.name,
+        position: selectedDevice.position,
+      } : 'No device selected',
+      isFrontCamera,
+      hasCameraPermission,
+      hasMicrophonePermission,
+      simulatorFallback
+    });
+  }, [device, fallbackDevice, selectedDevice, isFrontCamera, hasCameraPermission, hasMicrophonePermission, simulatorFallback]);
   
   // Setup settings (non-changeable per requirements)
   const [isForKids, setIsForKids] = useState(false); // Default: not for kids
@@ -180,44 +192,43 @@ const CreateLivestreamScreen = ({ navigation }) => {
   const [isChatVisible, setIsChatVisible] = useState(false);
   const [chatMessages, setChatMessages] = useState(INITIAL_CHAT_MESSAGES);
   const [messageText, setMessageText] = useState('');
+  const [showDebugModal, setShowDebugModal] = useState(false);
   
   const [streamKey, setStreamKey] = useState('');
   const [streamUrl, setStreamUrl] = useState('');
   const [broadcastId, setBroadcastId] = useState('');
+  const [streamData, setStreamData] = useState(null);
   
-  // Check if we're running on a simulator
+  // Check if we're running on a simulator - improved detection
   useEffect(() => {
-    // Real device detection
     const checkIfRealDevice = async () => {
       try {
-        // Default to assuming we're on a real device
-        setSimulatorFallback(false);
-        
         if (Platform.OS === 'ios') {
-          // Better iOS simulator detection
-          if (Platform.constants && 
-              Platform.constants.utsname && 
-              Platform.constants.utsname.machine) {
-            // Real devices will have models like "iPhone10,3", "iPad8,12", etc.
-            // Simulator models contain "Simulator" or don't start with "iPhone"
-            const deviceModel = Platform.constants.utsname.machine;
-            const isRealDevice = deviceModel.startsWith('iPhone') && !deviceModel.includes('Simulator');
-            
-            console.log('Device check: ', deviceModel, isRealDevice ? 'Real Device' : 'Simulator');
-            setSimulatorFallback(!isRealDevice);
-          }
+          // More reliable simulator detection for iOS
+          const isSimulator = Platform.isPad === false && Platform.isTVOS === false && 
+                             (Platform.constants.systemName === 'iOS' && 
+                              (Platform.constants.model.includes('Simulator') || 
+                               Platform.constants.model.includes('x86_64')));
+          console.log('[DEVICE] iOS Device Info:', {
+            model: Platform.constants.model,
+            systemName: Platform.constants.systemName,
+            isSimulator
+          });
+          setSimulatorFallback(isSimulator);
         } else if (Platform.OS === 'android') {
           // Android emulator detection
-          if (Platform.constants && 
-              (Platform.constants.Brand === 'google' || 
-              Platform.constants.Manufacturer === 'Google' ||
-              (Platform.constants.model && Platform.constants.model.includes('sdk')))) {
-            setSimulatorFallback(true);
-          }
+          const isEmulator = Platform.constants.Brand === 'google' && 
+                           Platform.constants.Manufacturer === 'Google';
+          console.log('[DEVICE] Android Device Info:', {
+            brand: Platform.constants.Brand,
+            manufacturer: Platform.constants.Manufacturer,
+            isEmulator
+          });
+          setSimulatorFallback(isEmulator);
         }
       } catch (err) {
-        console.log('Error in device detection:', err);
-        // If there's an error, assume we can use the camera
+        console.log('[DEVICE] Error in device detection:', err);
+        // If there's an error, assume we're on a real device
         setSimulatorFallback(false);
       }
     };
@@ -409,6 +420,7 @@ const CreateLivestreamScreen = ({ navigation }) => {
       // Save stream details
       setStreamKey(streamData.cdn.ingestionInfo.streamName);
       setStreamUrl(streamData.cdn.ingestionInfo.ingestionAddress);
+      setStreamData(streamData);
 
       // 3. Bind broadcast to stream
       console.warn('[YouTube API] Binding stream to broadcast');
@@ -483,10 +495,190 @@ const CreateLivestreamScreen = ({ navigation }) => {
     }
   };
 
+  // Start actual livestreaming
+  const startLiveStreaming = async () => {
+    try {
+      if (!streamKey) {
+        throw new Error('Stream key is required. Please create a broadcast first or enter a custom stream key.');
+      }
+
+      console.log('[LIVESTREAM] Starting RTMP stream with key:', streamKey);
+      console.log('[LIVESTREAM] Using stream URL:', streamUrl);
+      
+      // Start the RTMP livestream using API.video
+      if (liveStreamRef.current) {
+        // Use the exact YouTube RTMP URL provided during stream creation
+        const finalStreamUrl = streamUrl || 'rtmp://a.rtmp.youtube.com/live2';
+        
+        console.log('[LIVESTREAM] Starting stream to:', finalStreamUrl);
+        console.log('[LIVESTREAM] With stream key:', streamKey);
+        
+        // For YouTube RTMP, we need to ensure proper URL format
+        // YouTube expects: rtmp://a.rtmp.youtube.com/live2/STREAM_KEY
+        // But API.video component might handle URL construction differently
+        
+        console.log('[LIVESTREAM] Attempting to start stream with YouTube RTMP');
+        liveStreamRef.current.startStreaming(streamKey, finalStreamUrl);
+        console.log('[LIVESTREAM] RTMP stream command sent successfully');
+      }
+    } catch (error) {
+      console.error('[LIVESTREAM] Error starting stream:', error);
+      setStreamingError(error.message || error);
+      Alert.alert('Streaming Error', error.message || error);
+    }
+  };
+
+  // Stop livestreaming
+  const stopLiveStreaming = async () => {
+    try {
+      if (liveStreamRef.current && isStreaming) {
+        liveStreamRef.current.stopStreaming();
+        setIsStreaming(false);
+        setStreamingError(null);
+        console.log('[LIVESTREAM] RTMP stream stopped');
+      }
+    } catch (error) {
+      console.error('[LIVESTREAM] Error stopping stream:', error);
+    }
+  };
+
+  // Check stream status
+  const checkStreamStatus = async (streamId) => {
+    try {
+      const response = await fetch(
+        `https://www.googleapis.com/youtube/v3/liveStreams?part=status&id=${streamId}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${user.accessToken}`,
+          },
+        }
+      );
+
+      const data = await response.json();
+      console.warn('[YouTube API] Stream status check:', JSON.stringify(data, null, 2));
+
+      if (data.items && data.items.length > 0) {
+        const streamStatus = data.items[0].status.streamStatus;
+        const healthStatus = data.items[0].status.healthStatus?.status;
+        
+        console.warn(`[YouTube API] Stream status: ${streamStatus}, Health: ${healthStatus}`);
+        
+        // Return an object with both statuses
+        return {
+          streamStatus,
+          healthStatus,
+          isReady: streamStatus === 'ready' || streamStatus === 'active',
+          isActive: streamStatus === 'active',
+          hasData: healthStatus === 'good' || healthStatus === 'ok'
+        };
+      }
+      return { streamStatus: 'inactive', healthStatus: 'noData', isReady: false, isActive: false, hasData: false };
+    } catch (error) {
+      console.warn('[YouTube API] Error checking stream status:', error);
+      return { streamStatus: 'inactive', healthStatus: 'noData', isReady: false, isActive: false, hasData: false };
+    }
+  };
+
+  // Check broadcast status
+  const checkBroadcastStatus = async (broadcastId) => {
+    try {
+      const response = await fetch(
+        `https://www.googleapis.com/youtube/v3/liveBroadcasts?part=status&id=${broadcastId}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${user.accessToken}`,
+          },
+        }
+      );
+
+      const data = await response.json();
+      console.warn('[YouTube API] Broadcast status check:', JSON.stringify(data, null, 2));
+
+      if (data.items && data.items.length > 0) {
+        const broadcastStatus = data.items[0].status.lifeCycleStatus;
+        const privacyStatus = data.items[0].status.privacyStatus;
+        
+        console.warn(`[YouTube API] Broadcast status: ${broadcastStatus}, Privacy: ${privacyStatus}`);
+        
+        return {
+          broadcastStatus,
+          privacyStatus,
+          canGoLive: broadcastStatus === 'ready' || broadcastStatus === 'testing'
+        };
+      }
+      return { broadcastStatus: 'unknown', privacyStatus: 'unknown', canGoLive: false };
+    } catch (error) {
+      console.warn('[YouTube API] Error checking broadcast status:', error);
+      return { broadcastStatus: 'unknown', privacyStatus: 'unknown', canGoLive: false };
+    }
+  };
+
+  // Wait for stream to be active
+  const waitForStreamActive = async (streamId, maxAttempts = 60) => {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      console.warn(`[YouTube API] Checking stream status (attempt ${attempt}/${maxAttempts})`);
+      
+      const statusInfo = await checkStreamStatus(streamId);
+      
+      // Wait for actual data flow - this is crucial for YouTube
+      if (statusInfo.isReady && statusInfo.hasData) {
+        console.warn('[YouTube API] Stream is ready and has data, proceeding...');
+        return true;
+      }
+      
+      // For early attempts, just log the status
+      if (attempt <= 10) {
+        console.warn(`[YouTube API] Stream status: ${statusInfo.streamStatus}, Health: ${statusInfo.healthStatus} - waiting for data...`);
+      }
+      
+      // After many attempts, check if we should proceed anyway
+      if (attempt > 45 && statusInfo.isReady) {
+        console.warn('[YouTube API] Stream is ready but no data detected after long wait, proceeding anyway...');
+        return true;
+      }
+      
+      // Wait 3 seconds between checks to give more time for data to flow
+      await new Promise(resolve => setTimeout(resolve, 3000));
+    }
+    
+    console.warn('[YouTube API] Timeout waiting for stream to become active');
+    return false;
+  };
+
   // Go live
   const goLive = async () => {
     try {
-      console.warn('[YouTube API] Transitioning broadcast to live');
+      setIsWaitingForStream(true);
+      setStreamStatus('connecting');
+      
+      // First transition to live view to initialize the camera component
+      console.warn('[YouTube API] Transitioning to live view...');
+      setCurrentStep('live');
+      
+      // Give the camera component more time to initialize properly
+      console.warn('[YouTube API] Initializing camera component...');
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      // Now start the RTMP stream
+      console.warn('[YouTube API] Starting RTMP stream...');
+      await startLiveStreaming();
+      
+      // Wait longer for the stream to establish and start sending actual video data
+      console.warn('[YouTube API] Waiting for stream to establish and send video data...');
+      setStreamStatus('waiting');
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      
+      // Check if stream is ready and has data
+      console.warn('[YouTube API] Checking if stream is ready with data...');
+      const streamActive = await waitForStreamActive(streamData?.id);
+      
+      if (!streamActive) {
+        setStreamStatus('error');
+        throw new Error('Stream failed to become ready with data. Please check your internet connection and camera permissions, then try again.');
+      }
+
+      setStreamStatus('ready');
+      console.warn('[YouTube API] Stream is ready with data, transitioning broadcast to live');
       const response = await fetch(
         `https://www.googleapis.com/youtube/v3/liveBroadcasts/transition?broadcastStatus=live&id=${broadcastId}&part=status`,
         {
@@ -501,20 +693,30 @@ const CreateLivestreamScreen = ({ navigation }) => {
       console.warn('[YouTube API] Transition response:', JSON.stringify(data, null, 2));
 
       if (!response.ok) {
+        setStreamStatus('error');
         throw new Error(data.error?.message || 'Failed to go live');
       }
-
+      
       setIsLive(true);
-      setCurrentStep('live');
+      setIsWaitingForStream(false);
     } catch (error) {
       console.warn('[YouTube API] Error going live:', error);
-      Alert.alert('Error', 'Failed to go live');
+      setIsWaitingForStream(false);
+      setStreamStatus('error');
+      // Don't go back to preview if we're already in live view
+      if (currentStep !== 'live') {
+        setCurrentStep('preview');
+      }
+      Alert.alert('Error', error.message || 'Failed to go live');
     }
   };
 
   // End the livestream
   const endLivestream = async () => {
     try {
+      // Stop the actual livestreaming first
+      await stopLiveStreaming();
+      
       console.warn('[YouTube API] Ending broadcast');
       const response = await fetch(
         `https://www.googleapis.com/youtube/v3/liveBroadcasts/transition?broadcastStatus=complete&id=${broadcastId}&part=status`,
@@ -604,8 +806,54 @@ const CreateLivestreamScreen = ({ navigation }) => {
         maxLength={5000}
       />
       
-      {/* Fixed Settings */}
+      {/* Stream Quality Settings */}
       <Text style={styles.settingsTitle}>Stream Settings</Text>
+      
+      <View style={styles.settingRow}>
+        <View style={styles.settingInfo}>
+          <Text style={styles.settingLabel}>Stream Quality</Text>
+          <Text style={styles.settingDesc}>Higher quality uses more bandwidth</Text>
+        </View>
+        <View style={styles.qualityButtons}>
+          {['480p', '720p', '1080p'].map((quality) => (
+            <TouchableOpacity
+              key={quality}
+              style={[
+                styles.qualityButton,
+                streamQuality === quality && styles.qualityButtonActive
+              ]}
+              onPress={() => {
+                setStreamQuality(quality);
+                // Adjust bitrate based on quality
+                if (quality === '480p') setStreamBitrate(1500);
+                else if (quality === '720p') setStreamBitrate(2500);
+                else if (quality === '1080p') setStreamBitrate(4500);
+              }}
+            >
+              <Text style={[
+                styles.qualityButtonText,
+                streamQuality === quality && styles.qualityButtonTextActive
+              ]}>
+                {quality}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      </View>
+      
+      {/* Stream Key Input */}
+      <Text style={styles.inputLabel}>Stream Key (Optional)</Text>
+      <TextInput
+        style={styles.input}
+        value={streamKey}
+        onChangeText={setStreamKey}
+        placeholder="Enter your RTMP stream key (leave empty for YouTube)"
+        placeholderTextColor="#999"
+        secureTextEntry={false}
+      />
+      <Text style={styles.settingDesc}>
+        If you have a custom RTMP stream key, enter it here. Otherwise, YouTube stream key will be generated automatically.
+      </Text>
       
       <View style={styles.settingRow}>
         <View style={styles.settingInfo}>
@@ -663,109 +911,97 @@ const CreateLivestreamScreen = ({ navigation }) => {
   
   // Render camera preview
   const renderCameraPreview = () => {
-    console.log('Rendering camera preview:', {
-      cameraPermission,
-      microphonePermission,
-      hasDevice: !!device,
-      deviceInfo: device ? {
-        id: device.id,
-        name: device.name,
-        position: device.position
-      } : 'none'
+    console.log('[CAMERA] Rendering camera preview:', {
+      hasPermission: hasCameraPermission,
+      device: device?.name || 'No device',
+      simulatorFallback
     });
-    
-    if (cameraPermission !== 'granted') {
-      return renderPermissionsScreen();
-    }
-    
+
     if (simulatorFallback) {
       return renderSimulatorFallback();
     }
-    
-    if (!device) {
+
+    if (!hasCameraPermission) {
+      return renderPermissionsScreen();
+    }
+
+    if (!selectedDevice) {
       return (
-        <View style={styles.loadingContainer}>
-          <ActivityIndicator size="large" color="#FF0000" />
-          <Text style={styles.loadingText}>Loading camera...</Text>
-          <Text style={styles.debugText}>
-            {`Permissions - Camera: ${cameraPermission}, Mic: ${microphonePermission}`}
-          </Text>
-          <Text style={styles.debugText}>
-            {`Available devices: ${rawDevices ? rawDevices.length : 0}`}
-          </Text>
-          <Text style={styles.debugText}>
-            {`Front camera: ${devices.front ? devices.front.name : 'Not available'}`}
-          </Text>
-          <Text style={styles.debugText}>
-            {`Back camera: ${devices.back ? devices.back.name : 'Not available'}`}
-          </Text>
-          <TouchableOpacity 
-            style={styles.retryButton}
-            onPress={() => {
-              console.log('Retrying camera initialization...');
-              Camera.requestCameraPermission();
-            }}
-          >
-            <Text style={styles.retryButtonText}>Retry Camera</Text>
-          </TouchableOpacity>
+        <View style={styles.centerContainer}>
+          <ActivityIndicator size="large" color="#0000ff" />
+          <Text style={styles.errorText}>No camera available. Please check your device.</Text>
         </View>
       );
     }
-    
+
     return (
       <View style={styles.previewContainer}>
         <Camera
           ref={cameraRef}
           style={StyleSheet.absoluteFill}
-          device={device}
-          isActive={true}
-          audio={microphonePermission === 'granted'}
-          enableZoomGesture
+          device={selectedDevice}
+          isActive={currentStep === 'preview' || currentStep === 'live'}
           photo={true}
           video={true}
-          orientation="portrait"
+          audio={true}
+          torch={flash === 'on' ? 'on' : 'off'}
         />
-        
-        <View style={styles.previewHeader}>
-          <TouchableOpacity 
-            style={styles.headerButton}
-            onPress={() => setCurrentStep('setup')}
-          >
-            <MaterialIcons name="arrow-back" size={24} color="#FFFFFF" />
-          </TouchableOpacity>
-          
-          <View style={styles.previewInfo}>
-            <Text style={styles.previewTitle}>{title || 'Untitled Livestream'}</Text>
-            <Text style={styles.previewStatus}>Ready to go live</Text>
-          </View>
-        </View>
-        
-        <View style={styles.previewControls}>
-          <TouchableOpacity 
-            style={styles.controlButton}
+        {/* Camera controls */}
+        <View style={styles.controlsContainer}>
+          <TouchableOpacity
+            style={styles.cameraControl}
             onPress={() => setIsFrontCamera(!isFrontCamera)}
           >
-            <MaterialIcons name="flip-camera-ios" size={28} color="#FFFFFF" />
+            <MaterialIcons name="flip-camera-ios" size={24} color="white" />
           </TouchableOpacity>
-          
-          <TouchableOpacity 
-            style={styles.controlButton}
-            onPress={() => setFlash(flash === 'off' ? 'torch' : 'off')}
+          <TouchableOpacity
+            style={styles.cameraControl}
+            onPress={() => setFlash(flash === 'off' ? 'on' : 'off')}
           >
-            <MaterialIcons 
-              name={flash === 'off' ? "flash-off" : "flash-on"} 
-              size={28} 
-              color="#FFFFFF" 
+            <MaterialIcons
+              name={flash === 'off' ? 'flash-off' : 'flash-on'}
+              size={24}
+              color="white"
             />
           </TouchableOpacity>
-          
+          <TouchableOpacity
+            style={styles.cameraControl}
+            onPress={() => setShowDebugModal(true)}
+          >
+            <MaterialIcons name="bug-report" size={24} color="white" />
+          </TouchableOpacity>
+        </View>
+        
+        {/* Start Streaming Button */}
+        <View style={styles.streamButtonContainer}>
           <TouchableOpacity 
-            style={styles.goLiveButton}
+            style={[
+              styles.startStreamButton, 
+              (!streamKey || isWaitingForStream) && styles.startStreamButtonDisabled
+            ]}
             onPress={goLive}
+            disabled={!streamKey || isWaitingForStream}
           >
             <View style={styles.recordIcon} />
-            <Text style={styles.goLiveText}>START STREAMING</Text>
+            <Text style={styles.startStreamText}>
+              {isWaitingForStream ? 'CONNECTING...' : 
+               streamKey ? 'START STREAMING' : 'SETUP REQUIRED'}
+            </Text>
           </TouchableOpacity>
+          
+          {!streamKey && !isWaitingForStream && (
+            <Text style={styles.streamHint}>
+              Complete setup to enable streaming
+            </Text>
+          )}
+          
+          {isWaitingForStream && (
+            <Text style={styles.streamHint}>
+              {streamStatus === 'connecting' && 'Starting RTMP stream...'}
+              {streamStatus === 'waiting' && 'Waiting for stream to be ready...'}
+              {streamStatus === 'ready' && 'Stream ready, going live...'}
+            </Text>
+          )}
         </View>
       </View>
     );
@@ -785,6 +1021,72 @@ const CreateLivestreamScreen = ({ navigation }) => {
     </View>
   );
   
+  // Render debug modal
+  const renderDebugModal = () => (
+    <Modal
+      animationType="slide"
+      transparent={true}
+      visible={showDebugModal}
+      onRequestClose={() => setShowDebugModal(false)}
+    >
+      <View style={styles.debugOverlay}>
+        <View style={styles.debugContainer}>
+          <View style={styles.debugHeader}>
+            <Text style={styles.debugTitle}>Stream Debug Info</Text>
+            <TouchableOpacity onPress={() => setShowDebugModal(false)} style={styles.closeDebugButton}>
+              <MaterialIcons name="close" size={24} color="#FFF" />
+            </TouchableOpacity>
+          </View>
+          
+          <ScrollView style={styles.debugContent}>
+            <View style={styles.debugSection}>
+              <Text style={styles.debugSectionTitle}>📡 Stream Configuration</Text>
+              <Text style={styles.debugItem}>Stream Key: {streamKey ? '✅ Set' : '❌ Missing'}</Text>
+              <Text style={styles.debugItem}>Stream URL: {streamUrl ? '✅ Set' : '❌ Missing'}</Text>
+              <Text style={styles.debugItem}>Broadcast ID: {broadcastId ? '✅ Set' : '❌ Missing'}</Text>
+              <Text style={styles.debugItem}>Quality: {streamQuality}</Text>
+              <Text style={styles.debugItem}>Bitrate: {streamBitrate} kbps</Text>
+            </View>
+            
+            <View style={styles.debugSection}>
+              <Text style={styles.debugSectionTitle}>📱 Device Status</Text>
+              <Text style={styles.debugItem}>Camera Permission: {hasCameraPermission ? '✅ Granted' : '❌ Denied'}</Text>
+              <Text style={styles.debugItem}>Microphone Permission: {hasMicrophonePermission ? '✅ Granted' : '❌ Denied'}</Text>
+              <Text style={styles.debugItem}>Camera Device: {selectedDevice ? `✅ ${selectedDevice.name}` : '❌ No device'}</Text>
+              <Text style={styles.debugItem}>Camera Position: {isFrontCamera ? 'Front' : 'Back'}</Text>
+              <Text style={styles.debugItem}>Flash: {flash === 'on' ? 'On' : 'Off'}</Text>
+            </View>
+            
+            <View style={styles.debugSection}>
+              <Text style={styles.debugSectionTitle}>🔴 Streaming Status</Text>
+              <Text style={styles.debugItem}>Is Streaming: {isStreaming ? '✅ Active' : '❌ Inactive'}</Text>
+              <Text style={styles.debugItem}>Is Live: {isLive ? '✅ Live' : '❌ Not Live'}</Text>
+              <Text style={styles.debugItem}>Stream Status: {streamStatus}</Text>
+              <Text style={styles.debugItem}>Waiting for Stream: {isWaitingForStream ? 'Yes' : 'No'}</Text>
+              <Text style={styles.debugItem}>Stream Error: {streamingError || 'None'}</Text>
+              <Text style={styles.debugItem}>Viewer Count: {viewCount}</Text>
+            </View>
+            
+            <View style={styles.debugSection}>
+              <Text style={styles.debugSectionTitle}>🔧 Technical Details</Text>
+              <Text style={styles.debugItem}>Platform: {Platform.OS}</Text>
+              <Text style={styles.debugItem}>Simulator Fallback: {simulatorFallback ? 'Yes' : 'No'}</Text>
+              <Text style={styles.debugItem}>Current Step: {currentStep}</Text>
+              <Text style={styles.debugItem}>Title: {title || 'Not set'}</Text>
+            </View>
+            
+            {streamKey && (
+              <View style={styles.debugSection}>
+                <Text style={styles.debugSectionTitle}>🔑 Stream Key (Last 8 chars)</Text>
+                <Text style={styles.debugItem}>...{streamKey.slice(-8)}</Text>
+              </View>
+            )}
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  );
+
   // Render chat overlay
   const renderChatOverlay = () => (
     <Modal
@@ -933,23 +1235,66 @@ const CreateLivestreamScreen = ({ navigation }) => {
     
     return (
       <View style={styles.liveContainer}>
-        <Camera
-          ref={cameraRef}
+        <ApiVideoLiveStreamView
+          ref={liveStreamRef}
           style={styles.camera}
-          device={device}
-          isActive={true}
-          audio={true}
-          enableZoomGesture={true}
-          torch={flash}
+          camera={isFrontCamera ? 'front' : 'back'}
+          enablePinchedZoom={true}
+          video={{
+            fps: 30,
+            resolution: streamQuality,
+            bitrate: streamBitrate * 1000, // Convert kbps to bps (YouTube expects this format)
+            gopDuration: 2, // YouTube recommends 2-4 seconds for GOP duration
+          }}
+          audio={{
+            bitrate: 128000, // 128 kbps is good for YouTube
+            sampleRate: 44100, // Standard sample rate
+            isStereo: true,
+          }}
+          isMuted={false}
+          onConnectionSuccess={() => {
+            console.log('[LIVESTREAM] Stream connected successfully to YouTube RTMP');
+            console.log('[LIVESTREAM] Stream URL:', streamUrl);
+            console.log('[LIVESTREAM] Stream Key:', streamKey ? 'Present' : 'Missing');
+            setIsStreaming(true);
+            setStreamingError(null);
+            
+            // Start monitoring stream status after connection
+            setTimeout(() => {
+              if (streamData?.id) {
+                checkStreamStatus(streamData.id).then(status => {
+                  console.log('[LIVESTREAM] Post-connection stream status:', status);
+                });
+              }
+            }, 5000);
+          }}
+          onConnectionFailed={(error) => {
+            console.error('[LIVESTREAM] Connection failed to YouTube RTMP:', error);
+            console.error('[LIVESTREAM] Stream URL was:', streamUrl);
+            console.error('[LIVESTREAM] Stream Key present:', streamKey ? 'Yes' : 'No');
+            setStreamingError(error);
+            setIsStreaming(false);
+            Alert.alert('Connection Failed', 'Failed to connect to YouTube RTMP server: ' + error);
+          }}
+          onDisconnect={() => {
+            console.log('[LIVESTREAM] Stream disconnected from YouTube RTMP');
+            setIsStreaming(false);
+          }}
         />
         
         <View style={styles.liveHeader}>
           <View style={styles.liveIndicator}>
-            <View style={styles.liveDot} />
-            <Text style={styles.liveText}>LIVE</Text>
+            <View style={[styles.liveDot, { backgroundColor: isStreaming ? '#00FF00' : '#FF0000' }]} />
+            <Text style={styles.liveText}>{isStreaming ? 'STREAMING' : 'CONNECTING'}</Text>
           </View>
           
-          <Text style={styles.viewerCount}>{viewCount} watching</Text>
+          <View style={styles.streamInfo}>
+            <Text style={styles.viewerCount}>{viewCount} watching</Text>
+            <Text style={styles.streamQualityText}>{streamQuality}</Text>
+            {streamingError && (
+              <Text style={styles.streamError}>⚠️ {streamingError}</Text>
+            )}
+          </View>
         </View>
         
         <View style={styles.liveControls}>
@@ -1009,19 +1354,21 @@ const CreateLivestreamScreen = ({ navigation }) => {
         </Text>
       </View>
       
-      <View style={styles.previewHeader}>
-        <TouchableOpacity 
-          style={styles.headerButton}
-          onPress={() => setCurrentStep('setup')}
-        >
-          <MaterialIcons name="arrow-back" size={24} color="#FFFFFF" />
-        </TouchableOpacity>
-        
-        <View style={styles.previewInfo}>
-          <Text style={styles.previewTitle}>{title || 'Untitled Livestream'}</Text>
-          <Text style={styles.previewStatus}>Ready to go live</Text>
+              <View style={styles.previewHeader}>
+          <TouchableOpacity 
+            style={styles.headerButton}
+            onPress={() => setCurrentStep('setup')}
+          >
+            <MaterialIcons name="arrow-back" size={24} color="#FFFFFF" />
+          </TouchableOpacity>
+          
+          <View style={styles.previewInfo}>
+            <Text style={styles.previewTitle}>{title || 'Untitled Livestream'}</Text>
+            <Text style={styles.previewStatus}>
+              {streamKey ? 'Custom RTMP Ready' : 'YouTube Stream Ready'}
+            </Text>
+          </View>
         </View>
-      </View>
       
       <View style={styles.previewControls}>
         <TouchableOpacity 
@@ -1033,7 +1380,7 @@ const CreateLivestreamScreen = ({ navigation }) => {
         
         <TouchableOpacity 
           style={styles.controlButton}
-          onPress={() => setFlash(flash === 'off' ? 'torch' : 'off')}
+          onPress={() => setFlash(flash === 'off' ? 'on' : 'off')}
         >
           <MaterialIcons 
             name={flash === 'off' ? "flash-off" : "flash-on"} 
@@ -1043,11 +1390,25 @@ const CreateLivestreamScreen = ({ navigation }) => {
         </TouchableOpacity>
         
         <TouchableOpacity 
-          style={styles.goLiveButton}
+          style={styles.controlButton}
+          onPress={() => setShowDebugModal(true)}
+        >
+          <MaterialIcons name="bug-report" size={28} color="#FFFFFF" />
+        </TouchableOpacity>
+        
+        <TouchableOpacity 
+          style={[
+            styles.goLiveButton, 
+            (!streamKey || isWaitingForStream) && styles.startStreamButtonDisabled
+          ]}
           onPress={goLive}
+          disabled={!streamKey || isWaitingForStream}
         >
           <View style={styles.recordIcon} />
-          <Text style={styles.goLiveText}>START STREAMING</Text>
+          <Text style={styles.goLiveText}>
+            {isWaitingForStream ? 'CONNECTING...' : 
+             streamKey ? 'START STREAMING' : 'SETUP REQUIRED'}
+          </Text>
         </TouchableOpacity>
       </View>
     </View>
@@ -1072,6 +1433,7 @@ const CreateLivestreamScreen = ({ navigation }) => {
         {currentStep === 'setup' && renderSetupForm()}
         {currentStep === 'preview' && renderCameraPreview()}
         {currentStep === 'live' && renderLiveView()}
+        {renderDebugModal()}
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
@@ -1554,6 +1916,171 @@ const styles = StyleSheet.create({
     color: 'white',
     fontSize: 16,
     fontWeight: 'bold',
+  },
+  centerContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#fff',
+  },
+  errorText: {
+    marginTop: 16,
+    fontSize: 16,
+    color: '#333',
+  },
+  controlsContainer: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    alignItems: 'center',
+    padding: 20,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+  },
+  cameraControl: {
+    width: 50,
+    height: 50,
+    borderRadius: 25,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  qualityButtons: {
+    flexDirection: 'row',
+  },
+  qualityButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 4,
+    borderWidth: 1,
+    borderColor: '#ddd',
+    marginLeft: 8,
+    backgroundColor: '#f9f9f9',
+  },
+  qualityButtonActive: {
+    backgroundColor: '#FF0000',
+    borderColor: '#FF0000',
+  },
+  qualityButtonText: {
+    fontSize: 12,
+    color: '#333',
+    fontWeight: '500',
+  },
+  qualityButtonTextActive: {
+    color: '#FFFFFF',
+  },
+  streamInfo: {
+    alignItems: 'flex-end',
+  },
+  streamQualityText: {
+    color: 'white',
+    fontSize: 12,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    paddingVertical: 2,
+    paddingHorizontal: 6,
+    borderRadius: 4,
+    marginTop: 4,
+  },
+  streamError: {
+    color: '#FF6666',
+    fontSize: 12,
+    backgroundColor: 'rgba(0,0,0,0.8)',
+    paddingVertical: 2,
+    paddingHorizontal: 6,
+    borderRadius: 4,
+    marginTop: 4,
+    maxWidth: 200,
+  },
+  streamButtonContainer: {
+    position: 'absolute',
+    bottom: 100,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    paddingHorizontal: 20,
+  },
+  startStreamButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FF0000',
+    paddingHorizontal: 24,
+    paddingVertical: 16,
+    borderRadius: 30,
+    minWidth: 200,
+    justifyContent: 'center',
+  },
+  startStreamButtonDisabled: {
+    backgroundColor: '#666666',
+  },
+  startStreamText: {
+    color: 'white',
+    fontWeight: 'bold',
+    fontSize: 16,
+    marginLeft: 8,
+  },
+  streamHint: {
+    color: 'white',
+    fontSize: 12,
+    marginTop: 8,
+    textAlign: 'center',
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    borderRadius: 4,
+  },
+  debugOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.8)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  debugContainer: {
+    width: width * 0.9,
+    height: height * 0.8,
+    backgroundColor: '#1a1a1a',
+    borderRadius: 12,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#333',
+  },
+  debugHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: '#FF0000',
+    padding: 16,
+  },
+  debugTitle: {
+    color: '#FFF',
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  closeDebugButton: {
+    padding: 4,
+  },
+  debugContent: {
+    flex: 1,
+    padding: 16,
+  },
+  debugSection: {
+    marginBottom: 20,
+    backgroundColor: '#2a2a2a',
+    padding: 12,
+    borderRadius: 8,
+  },
+  debugSectionTitle: {
+    color: '#FFF',
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginBottom: 8,
+  },
+  debugItem: {
+    color: '#CCC',
+    fontSize: 14,
+    marginBottom: 4,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
   },
 });
 
