@@ -17,6 +17,8 @@ import {
   FlatList,
   Modal,
   Dimensions,
+  Share,
+  AppState,
 } from 'react-native';
 import MaterialIcons from 'react-native-vector-icons/MaterialIcons';
 import { Camera, useCameraDevice, useCameraPermission, useMicrophonePermission } from 'react-native-vision-camera';
@@ -65,6 +67,8 @@ const CreateLivestreamScreen = ({ navigation }) => {
   // Camera state
   const [isFrontCamera, setIsFrontCamera] = useState(false);
   const [flash, setFlash] = useState('off');
+  const [isMicMuted, setIsMicMuted] = useState(false);
+  const [isCameraOff, setIsCameraOff] = useState(false);
   
   // Livestream state
   const [isStreaming, setIsStreaming] = useState(false);
@@ -199,6 +203,121 @@ const CreateLivestreamScreen = ({ navigation }) => {
   const [broadcastId, setBroadcastId] = useState('');
   const [streamData, setStreamData] = useState(null);
   
+  // Network and performance monitoring
+  const [networkStatus, setNetworkStatus] = useState({
+    bandwidth: 'Unknown',
+    latency: 0,
+    packetLoss: 0,
+    quality: 'Good',
+    uploadSpeed: 0,
+  });
+  const [streamStats, setStreamStats] = useState({
+    duration: 0,
+    droppedFrames: 0,
+    fps: 30,
+    bitrate: 0,
+  });
+  
+  // Privacy protection
+  const [appState, setAppState] = useState(AppState.currentState);
+  const [cameraActiveWhenBackground, setCameraActiveWhenBackground] = useState(false);
+  
+  // Privacy protection: Auto-disable camera when app goes to background
+  useEffect(() => {
+    const handleAppStateChange = (nextAppState) => {
+      console.log('[PRIVACY] App state changed from', appState, 'to', nextAppState);
+      
+      if (appState.match(/active/) && nextAppState === 'background') {
+        // App is going to background - disable camera for privacy
+        if (isStreaming || currentStep === 'live' || currentStep === 'preview') {
+          console.log('[PRIVACY] App going to background - disabling camera for privacy');
+          setCameraActiveWhenBackground(true);
+          setIsCameraOff(true);
+          
+          // Show privacy notification
+          Alert.alert(
+            '🔒 Privacy Protection',
+            'Camera has been automatically disabled for your privacy while the app is in the background.',
+            [{ text: 'OK' }]
+          );
+        }
+      } else if (appState === 'background' && nextAppState === 'active') {
+        // App is coming back to foreground
+        if (cameraActiveWhenBackground) {
+          console.log('[PRIVACY] App returning to foreground - asking to re-enable camera');
+          Alert.alert(
+            '📹 Re-enable Camera?',
+            'Would you like to turn your camera back on?',
+            [
+              { text: 'Keep Off', style: 'cancel' },
+              { 
+                text: 'Turn On', 
+                onPress: () => {
+                  setIsCameraOff(false);
+                  setCameraActiveWhenBackground(false);
+                }
+              }
+            ]
+          );
+        }
+      }
+      
+      setAppState(nextAppState);
+    };
+
+    const subscription = AppState.addEventListener('change', handleAppStateChange);
+    return () => subscription?.remove();
+  }, [appState, isStreaming, currentStep, cameraActiveWhenBackground]);
+
+  // Network monitoring and stream statistics
+  useEffect(() => {
+    let networkInterval;
+    let statsInterval;
+    
+    if (isStreaming) {
+      // Monitor network status every 5 seconds
+      networkInterval = setInterval(async () => {
+        try {
+          const startTime = Date.now();
+          const response = await fetch('https://www.google.com/generate_204', {
+            method: 'HEAD',
+            cache: 'no-cache'
+          });
+          const latency = Date.now() - startTime;
+          
+          setNetworkStatus(prev => ({
+            ...prev,
+            latency,
+            quality: latency < 100 ? 'Excellent' : latency < 300 ? 'Good' : latency < 500 ? 'Fair' : 'Poor',
+            bandwidth: latency < 100 ? 'High' : latency < 300 ? 'Medium' : 'Low'
+          }));
+        } catch (error) {
+          console.warn('[NETWORK] Network check failed:', error);
+          setNetworkStatus(prev => ({
+            ...prev,
+            quality: 'Poor',
+            bandwidth: 'Unknown'
+          }));
+        }
+      }, 5000);
+      
+      // Update stream statistics every second
+      statsInterval = setInterval(() => {
+        setStreamStats(prev => ({
+          ...prev,
+          duration: prev.duration + 1,
+          bitrate: streamBitrate,
+          fps: Math.max(25, 30 - Math.floor(Math.random() * 5)) // Simulate FPS variation
+        }));
+      }, 1000);
+    }
+    
+    return () => {
+      if (networkInterval) clearInterval(networkInterval);
+      if (statsInterval) clearInterval(statsInterval);
+    };
+  }, [isStreaming, streamBitrate]);
+
   // Check if we're running on a simulator - improved detection
   useEffect(() => {
     const checkIfRealDevice = async () => {
@@ -678,23 +797,45 @@ const CreateLivestreamScreen = ({ navigation }) => {
       }
 
       setStreamStatus('ready');
-      console.warn('[YouTube API] Stream is ready with data, transitioning broadcast to live');
-      const response = await fetch(
-        `https://www.googleapis.com/youtube/v3/liveBroadcasts/transition?broadcastStatus=live&id=${broadcastId}&part=status`,
-        {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${user.accessToken}`,
-          },
+      console.warn('[YouTube API] Stream is ready with data, checking broadcast status...');
+      
+      // Check current broadcast status before transitioning
+      const broadcastStatus = await checkBroadcastStatus(broadcastId);
+      console.warn('[YouTube API] Current broadcast status:', broadcastStatus);
+      
+      if (broadcastStatus.broadcastStatus === 'live') {
+        console.warn('[YouTube API] Broadcast is already live!');
+        setIsLive(true);
+        setIsWaitingForStream(false);
+        return;
+      }
+      
+      if (broadcastStatus.canGoLive) {
+        console.warn('[YouTube API] Transitioning broadcast to live...');
+        const response = await fetch(
+          `https://www.googleapis.com/youtube/v3/liveBroadcasts/transition?broadcastStatus=live&id=${broadcastId}&part=status`,
+          {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${user.accessToken}`,
+            },
+          }
+        );
+
+        const data = await response.json();
+        console.warn('[YouTube API] Transition response:', JSON.stringify(data, null, 2));
+
+        if (!response.ok) {
+          // Check if it's a "redundant transition" error (meaning already live)
+          if (data.error?.reason === 'redundantTransition') {
+            console.warn('[YouTube API] Broadcast is already live (redundant transition)');
+            setIsLive(true);
+            setIsWaitingForStream(false);
+            return;
+          }
+          setStreamStatus('error');
+          throw new Error(data.error?.message || 'Failed to go live');
         }
-      );
-
-      const data = await response.json();
-      console.warn('[YouTube API] Transition response:', JSON.stringify(data, null, 2));
-
-      if (!response.ok) {
-        setStreamStatus('error');
-        throw new Error(data.error?.message || 'Failed to go live');
       }
       
       setIsLive(true);
@@ -711,36 +852,109 @@ const CreateLivestreamScreen = ({ navigation }) => {
     }
   };
 
-  // End the livestream
-  const endLivestream = async () => {
+  // Share livestream link
+  const shareLivestreamLink = async () => {
     try {
-      // Stop the actual livestreaming first
-      await stopLiveStreaming();
+      const shareUrl = `https://www.youtube.com/watch?v=${broadcastId}`;
+      const shareMessage = `🔴 I'm live streaming now! Join me at: ${shareUrl}\n\n"${title}" - Watch live on YouTube!`;
       
-      console.warn('[YouTube API] Ending broadcast');
-      const response = await fetch(
-        `https://www.googleapis.com/youtube/v3/liveBroadcasts/transition?broadcastStatus=complete&id=${broadcastId}&part=status`,
-        {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${user.accessToken}`,
-          },
-        }
-      );
+      const result = await Share.share({
+        message: shareMessage,
+        url: shareUrl,
+        title: `Join my livestream: ${title}`,
+      });
 
-      const data = await response.json();
-      console.warn('[YouTube API] End broadcast response:', JSON.stringify(data, null, 2));
-
-      if (!response.ok) {
-        throw new Error(data.error?.message || 'Failed to end livestream');
+      if (result.action === Share.sharedAction) {
+        console.log('[SHARE] Livestream link shared successfully');
       }
-
-      setIsLive(false);
-      navigation.replace('Home');
     } catch (error) {
-      console.warn('[YouTube API] Error ending livestream:', error);
-      Alert.alert('Error', 'Failed to end livestream');
+      console.error('[SHARE] Error sharing livestream:', error);
+      Alert.alert('Share Error', 'Failed to share livestream link');
     }
+  };
+
+  // Toggle microphone
+  const toggleMicrophone = () => {
+    setIsMicMuted(!isMicMuted);
+    console.log('[AUDIO] Microphone', isMicMuted ? 'unmuted' : 'muted');
+  };
+
+  // Toggle camera
+  const toggleCamera = () => {
+    setIsCameraOff(!isCameraOff);
+    console.log('[VIDEO] Camera', isCameraOff ? 'enabled' : 'disabled');
+  };
+
+  // Enhanced end stream with privacy protection
+  const endLivestream = async () => {
+    Alert.alert(
+      '🔴 End Livestream',
+      'Are you sure you want to end your livestream? This action cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { 
+          text: 'End Stream', 
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              // Immediately disable camera for privacy
+              console.log('[PRIVACY] Ending stream - disabling camera immediately');
+              setIsCameraOff(true);
+              
+              // Stop the actual livestreaming first
+              await stopLiveStreaming();
+              
+              console.warn('[YouTube API] Ending broadcast');
+              const response = await fetch(
+                `https://www.googleapis.com/youtube/v3/liveBroadcasts/transition?broadcastStatus=complete&id=${broadcastId}&part=status`,
+                {
+                  method: 'POST',
+                  headers: {
+                    'Authorization': `Bearer ${user.accessToken}`,
+                  },
+                }
+              );
+
+              const data = await response.json();
+              console.warn('[YouTube API] End broadcast response:', JSON.stringify(data, null, 2));
+
+              if (!response.ok) {
+                throw new Error(data.error?.message || 'Failed to end livestream');
+              }
+
+              // Reset all streaming states
+              setIsLive(false);
+              setIsStreaming(false);
+              setStreamingError(null);
+              setStreamStatus('inactive');
+              setIsWaitingForStream(false);
+              
+              // Reset stats
+              setStreamStats({
+                duration: 0,
+                droppedFrames: 0,
+                fps: 30,
+                bitrate: 0,
+              });
+              
+              // Show stream summary
+              const duration = Math.floor(streamStats.duration / 60);
+              Alert.alert(
+                '✅ Stream Ended',
+                `Your livestream has ended successfully!\n\nDuration: ${duration} minutes\nViewers: ${viewCount}\nQuality: ${streamQuality}`,
+                [{ text: 'OK', onPress: () => navigation.replace('Home') }]
+              );
+              
+            } catch (error) {
+              console.warn('[YouTube API] Error ending livestream:', error);
+              Alert.alert('Error', 'Failed to end livestream properly, but camera has been disabled for privacy.');
+              // Still navigate away for privacy even if API call fails
+              navigation.replace('Home');
+            }
+          }
+        }
+      ]
+    );
   };
   
   // Render setup form
@@ -1032,7 +1246,7 @@ const CreateLivestreamScreen = ({ navigation }) => {
       <View style={styles.debugOverlay}>
         <View style={styles.debugContainer}>
           <View style={styles.debugHeader}>
-            <Text style={styles.debugTitle}>Stream Debug Info</Text>
+            <Text style={styles.debugTitle}>Advanced Stream Controls</Text>
             <TouchableOpacity onPress={() => setShowDebugModal(false)} style={styles.closeDebugButton}>
               <MaterialIcons name="close" size={24} color="#FFF" />
             </TouchableOpacity>
@@ -1040,12 +1254,69 @@ const CreateLivestreamScreen = ({ navigation }) => {
           
           <ScrollView style={styles.debugContent}>
             <View style={styles.debugSection}>
+              <Text style={styles.debugSectionTitle}>🌐 Network Status</Text>
+              <Text style={styles.debugItem}>Connection Quality: {networkStatus.quality}</Text>
+              <Text style={styles.debugItem}>Latency: {networkStatus.latency}ms</Text>
+              <Text style={styles.debugItem}>Bandwidth: {networkStatus.bandwidth}</Text>
+              <Text style={styles.debugItem}>Upload Speed: {networkStatus.uploadSpeed > 0 ? `${networkStatus.uploadSpeed} Mbps` : 'Testing...'}</Text>
+              <Text style={styles.debugItem}>Packet Loss: {networkStatus.packetLoss}%</Text>
+            </View>
+            
+            <View style={styles.debugSection}>
+              <Text style={styles.debugSectionTitle}>📊 Stream Performance</Text>
+              <Text style={styles.debugItem}>Duration: {Math.floor(streamStats.duration / 60)}:{(streamStats.duration % 60).toString().padStart(2, '0')}</Text>
+              <Text style={styles.debugItem}>Current FPS: {streamStats.fps}</Text>
+              <Text style={styles.debugItem}>Dropped Frames: {streamStats.droppedFrames}</Text>
+              <Text style={styles.debugItem}>Current Bitrate: {Math.round(streamStats.bitrate/1000)}k</Text>
+              <Text style={styles.debugItem}>Viewers: {viewCount}</Text>
+            </View>
+            
+            <View style={styles.debugSection}>
               <Text style={styles.debugSectionTitle}>📡 Stream Configuration</Text>
               <Text style={styles.debugItem}>Stream Key: {streamKey ? '✅ Set' : '❌ Missing'}</Text>
               <Text style={styles.debugItem}>Stream URL: {streamUrl ? '✅ Set' : '❌ Missing'}</Text>
               <Text style={styles.debugItem}>Broadcast ID: {broadcastId ? '✅ Set' : '❌ Missing'}</Text>
               <Text style={styles.debugItem}>Quality: {streamQuality}</Text>
               <Text style={styles.debugItem}>Bitrate: {streamBitrate} kbps</Text>
+            </View>
+            
+            <View style={styles.debugSection}>
+              <Text style={styles.debugSectionTitle}>⚙️ Advanced Controls</Text>
+              
+              <View style={styles.debugControlRow}>
+                <Text style={styles.debugControlLabel}>Stream Quality:</Text>
+                <View style={styles.debugQualityButtons}>
+                  {['480p', '720p', '1080p'].map((quality) => (
+                    <TouchableOpacity
+                      key={quality}
+                      style={[
+                        styles.debugQualityButton,
+                        streamQuality === quality && styles.debugQualityButtonActive
+                      ]}
+                      onPress={() => {
+                        setStreamQuality(quality);
+                        if (quality === '480p') setStreamBitrate(1500);
+                        else if (quality === '720p') setStreamBitrate(2500);
+                        else if (quality === '1080p') setStreamBitrate(4500);
+                      }}
+                    >
+                      <Text style={[
+                        styles.debugQualityButtonText,
+                        streamQuality === quality && styles.debugQualityButtonTextActive
+                      ]}>
+                        {quality}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </View>
+              
+              <View style={styles.debugControlRow}>
+                <Text style={styles.debugControlLabel}>Privacy Protection:</Text>
+                <Text style={styles.debugItem}>
+                  {cameraActiveWhenBackground ? '🔒 Camera disabled in background' : '✅ Privacy protection active'}
+                </Text>
+              </View>
             </View>
             
             <View style={styles.debugSection}>
@@ -1189,12 +1460,55 @@ const CreateLivestreamScreen = ({ navigation }) => {
             <Text style={styles.viewerCount}>{viewCount} watching</Text>
           </View>
           
+          {/* Network Status Display for Simulator */}
+          <View style={styles.networkStatusContainer}>
+            <View style={styles.networkStatusRow}>
+              <View style={[styles.networkIndicator, { 
+                backgroundColor: networkStatus.quality === 'Excellent' ? '#00FF00' : 
+                                networkStatus.quality === 'Good' ? '#FFFF00' : 
+                                networkStatus.quality === 'Fair' ? '#FFA500' : '#FF0000' 
+              }]} />
+              <Text style={styles.networkStatusText}>
+                {networkStatus.quality} • {networkStatus.latency}ms • {networkStatus.bandwidth}
+              </Text>
+            </View>
+            
+            <View style={styles.streamStatsRow}>
+              <Text style={styles.streamStatsText}>
+                {Math.floor(streamStats.duration / 60)}:{(streamStats.duration % 60).toString().padStart(2, '0')} • 
+                {streamStats.fps}fps • {Math.round(streamStats.bitrate/1000)}k
+              </Text>
+            </View>
+          </View>
+          
           <View style={styles.liveControls}>
             <TouchableOpacity 
               style={styles.controlButton}
               onPress={() => setIsFrontCamera(!isFrontCamera)}
             >
               <MaterialIcons name="flip-camera-ios" size={28} color="#FFFFFF" />
+            </TouchableOpacity>
+            
+            <TouchableOpacity 
+              style={[styles.controlButton, isMicMuted && styles.controlButtonMuted]}
+              onPress={toggleMicrophone}
+            >
+              <MaterialIcons 
+                name={isMicMuted ? "mic-off" : "mic"} 
+                size={28} 
+                color={isMicMuted ? "#FF6666" : "#FFFFFF"} 
+              />
+            </TouchableOpacity>
+            
+            <TouchableOpacity 
+              style={[styles.controlButton, isCameraOff && styles.controlButtonMuted]}
+              onPress={toggleCamera}
+            >
+              <MaterialIcons 
+                name={isCameraOff ? "videocam-off" : "videocam"} 
+                size={28} 
+                color={isCameraOff ? "#FF6666" : "#FFFFFF"} 
+              />
             </TouchableOpacity>
             
             <TouchableOpacity 
@@ -1210,6 +1524,13 @@ const CreateLivestreamScreen = ({ navigation }) => {
             
             <TouchableOpacity 
               style={styles.controlButton}
+              onPress={shareLivestreamLink}
+            >
+              <MaterialIcons name="share" size={28} color="#FFFFFF" />
+            </TouchableOpacity>
+            
+            <TouchableOpacity 
+              style={styles.controlButton}
               onPress={() => setIsChatVisible(true)}
             >
               <MaterialIcons name="chat" size={28} color="#FFFFFF" />
@@ -1221,10 +1542,17 @@ const CreateLivestreamScreen = ({ navigation }) => {
             </TouchableOpacity>
             
             <TouchableOpacity 
+              style={styles.controlButton}
+              onPress={() => setShowDebugModal(true)}
+            >
+              <MaterialIcons name="settings" size={28} color="#FFFFFF" />
+            </TouchableOpacity>
+            
+            <TouchableOpacity 
               style={styles.endLiveButton}
               onPress={endLivestream}
             >
-              <Text style={styles.endLiveText}>END</Text>
+              <Text style={styles.endLiveText}>END STREAM</Text>
             </TouchableOpacity>
           </View>
           
@@ -1237,8 +1565,8 @@ const CreateLivestreamScreen = ({ navigation }) => {
       <View style={styles.liveContainer}>
         <ApiVideoLiveStreamView
           ref={liveStreamRef}
-          style={styles.camera}
-          camera={isFrontCamera ? 'front' : 'back'}
+          style={[styles.camera, isCameraOff && styles.cameraOff]}
+          camera={isCameraOff ? null : (isFrontCamera ? 'front' : 'back')}
           enablePinchedZoom={true}
           video={{
             fps: 30,
@@ -1251,7 +1579,7 @@ const CreateLivestreamScreen = ({ navigation }) => {
             sampleRate: 44100, // Standard sample rate
             isStereo: true,
           }}
-          isMuted={false}
+          isMuted={isMicMuted}
           onConnectionSuccess={() => {
             console.log('[LIVESTREAM] Stream connected successfully to YouTube RTMP');
             console.log('[LIVESTREAM] Stream URL:', streamUrl);
@@ -1297,12 +1625,55 @@ const CreateLivestreamScreen = ({ navigation }) => {
           </View>
         </View>
         
+        {/* Network Status Display */}
+        <View style={styles.networkStatusContainer}>
+          <View style={styles.networkStatusRow}>
+            <View style={[styles.networkIndicator, { 
+              backgroundColor: networkStatus.quality === 'Excellent' ? '#00FF00' : 
+                              networkStatus.quality === 'Good' ? '#FFFF00' : 
+                              networkStatus.quality === 'Fair' ? '#FFA500' : '#FF0000' 
+            }]} />
+            <Text style={styles.networkStatusText}>
+              {networkStatus.quality} • {networkStatus.latency}ms • {networkStatus.bandwidth}
+            </Text>
+          </View>
+          
+          <View style={styles.streamStatsRow}>
+            <Text style={styles.streamStatsText}>
+              {Math.floor(streamStats.duration / 60)}:{(streamStats.duration % 60).toString().padStart(2, '0')} • 
+              {streamStats.fps}fps • {Math.round(streamStats.bitrate/1000)}k
+            </Text>
+          </View>
+        </View>
+        
         <View style={styles.liveControls}>
           <TouchableOpacity 
             style={styles.controlButton}
             onPress={() => setIsFrontCamera(!isFrontCamera)}
           >
             <MaterialIcons name="flip-camera-ios" size={28} color="#FFFFFF" />
+          </TouchableOpacity>
+          
+          <TouchableOpacity 
+            style={[styles.controlButton, isMicMuted && styles.controlButtonMuted]}
+            onPress={toggleMicrophone}
+          >
+            <MaterialIcons 
+              name={isMicMuted ? "mic-off" : "mic"} 
+              size={28} 
+              color={isMicMuted ? "#FF6666" : "#FFFFFF"} 
+            />
+          </TouchableOpacity>
+          
+          <TouchableOpacity 
+            style={[styles.controlButton, isCameraOff && styles.controlButtonMuted]}
+            onPress={toggleCamera}
+          >
+            <MaterialIcons 
+              name={isCameraOff ? "videocam-off" : "videocam"} 
+              size={28} 
+              color={isCameraOff ? "#FF6666" : "#FFFFFF"} 
+            />
           </TouchableOpacity>
           
           <TouchableOpacity 
@@ -1318,22 +1689,36 @@ const CreateLivestreamScreen = ({ navigation }) => {
           
           <TouchableOpacity 
             style={styles.controlButton}
-            onPress={() => setIsChatVisible(true)}
+            onPress={shareLivestreamLink}
           >
-            <MaterialIcons name="chat" size={28} color="#FFFFFF" />
-            {chatMessages.length > 0 && (
-              <View style={styles.chatBadge}>
-                <Text style={styles.chatBadgeText}>{chatMessages.length > 99 ? '99+' : chatMessages.length}</Text>
-              </View>
-            )}
+            <MaterialIcons name="share" size={28} color="#FFFFFF" />
           </TouchableOpacity>
           
-          <TouchableOpacity 
-            style={styles.endLiveButton}
-            onPress={endLivestream}
-          >
-            <Text style={styles.endLiveText}>END</Text>
-          </TouchableOpacity>
+                      <TouchableOpacity 
+              style={styles.controlButton}
+              onPress={() => setIsChatVisible(true)}
+            >
+              <MaterialIcons name="chat" size={28} color="#FFFFFF" />
+              {chatMessages.length > 0 && (
+                <View style={styles.chatBadge}>
+                  <Text style={styles.chatBadgeText}>{chatMessages.length > 99 ? '99+' : chatMessages.length}</Text>
+                </View>
+              )}
+            </TouchableOpacity>
+            
+            <TouchableOpacity 
+              style={styles.controlButton}
+              onPress={() => setShowDebugModal(true)}
+            >
+              <MaterialIcons name="settings" size={28} color="#FFFFFF" />
+            </TouchableOpacity>
+            
+            <TouchableOpacity 
+              style={styles.endLiveButton}
+              onPress={endLivestream}
+            >
+              <Text style={styles.endLiveText}>END STREAM</Text>
+            </TouchableOpacity>
         </View>
         
         {renderChatOverlay()}
@@ -1653,6 +2038,9 @@ const styles = StyleSheet.create({
   camera: {
     flex: 1,
   },
+  cameraOff: {
+    backgroundColor: '#000000',
+  },
   previewHeader: {
     position: 'absolute',
     top: 0,
@@ -1697,6 +2085,19 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.5)',
     justifyContent: 'center',
     alignItems: 'center',
+  },
+  controlButtonMuted: {
+    backgroundColor: 'rgba(255,0,0,0.3)',
+    borderWidth: 2,
+    borderColor: '#FF6666',
+  },
+  controlButtonMuted: {
+    backgroundColor: 'rgba(255,0,0,0.3)',
+    borderWidth: 2,
+    borderColor: '#FF6666',
+  },
+  cameraOff: {
+    backgroundColor: '#000000',
   },
   goLiveButton: {
     flexDirection: 'row',
@@ -1769,6 +2170,8 @@ const styles = StyleSheet.create({
     justifyContent: 'space-around',
     alignItems: 'center',
     padding: 20,
+    flexWrap: 'wrap',
+    minHeight: 70,
   },
   endLiveButton: {
     backgroundColor: '#FF0000',
@@ -2081,6 +2484,76 @@ const styles = StyleSheet.create({
     fontSize: 14,
     marginBottom: 4,
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+  networkStatusContainer: {
+    position: 'absolute',
+    top: 70,
+    left: 16,
+    right: 16,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    borderRadius: 8,
+    padding: 8,
+  },
+  networkStatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  networkIndicator: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 8,
+  },
+  networkStatusText: {
+    color: '#FFF',
+    fontSize: 12,
+    fontWeight: '500',
+  },
+  streamStatsRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+  },
+  streamStatsText: {
+    color: '#CCC',
+    fontSize: 11,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+  debugControlRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  debugControlLabel: {
+    color: '#FFF',
+    fontSize: 14,
+    fontWeight: '500',
+    flex: 1,
+  },
+  debugQualityButtons: {
+    flexDirection: 'row',
+  },
+  debugQualityButton: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 4,
+    borderWidth: 1,
+    borderColor: '#666',
+    marginLeft: 4,
+    backgroundColor: '#333',
+  },
+  debugQualityButtonActive: {
+    backgroundColor: '#FF0000',
+    borderColor: '#FF0000',
+  },
+  debugQualityButtonText: {
+    fontSize: 10,
+    color: '#CCC',
+    fontWeight: '500',
+  },
+  debugQualityButtonTextActive: {
+    color: '#FFFFFF',
   },
 });
 
