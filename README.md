@@ -35,7 +35,7 @@ graph TB
     end
     
     subgraph "Streaming Layer"
-        C --> G[@api.video/react-native-livestream]
+        C --> G[ApiVideoLiveStream]
         G --> H[RTMP Encoder]
         H --> I[H.264/AAC Encoding]
     end
@@ -122,7 +122,7 @@ useEffect(() => {
 
 ## 🎥 Video Encoding Pipeline
 
-### Module: `@api.video/react-native-livestream`
+### Module: @api.video/react-native-livestream
 
 This module handles the complex video encoding and RTMP streaming:
 
@@ -162,13 +162,13 @@ sequenceDiagram
     participant Camera as iOS Camera
     participant Vision as VisionCamera
     participant ApiVideo as ApiVideoLiveStream
-    participant Encoder as H.264 Encoder
+    participant Encoder as H264 Encoder
     participant RTMP as RTMP Client
     
     Camera->>Vision: Raw camera frames
     Vision->>ApiVideo: Processed video frames
     ApiVideo->>Encoder: Frame + audio data
-    Encoder->>Encoder: H.264/AAC encoding
+    Encoder->>Encoder: H264/AAC encoding
     Encoder->>RTMP: Encoded stream
     RTMP->>YouTube: RTMP packets
 ```
@@ -532,7 +532,7 @@ sequenceDiagram
     App->>ApiVideo: Start streaming
     ApiVideo->>Camera: Capture video/audio
     Camera->>ApiVideo: Raw media data
-    ApiVideo->>ApiVideo: H.264/AAC encoding
+    ApiVideo->>ApiVideo: H264/AAC encoding
     ApiVideo->>RTMP: RTMP stream
     RTMP->>YouTube: Video/audio packets
     App->>YouTube: Transition to live
