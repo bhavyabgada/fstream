@@ -194,9 +194,21 @@ const CreateLivestreamScreen = ({ navigation }) => {
   const [currentStep, setCurrentStep] = useState('setup'); // setup, preview, live
   const [viewCount, setViewCount] = useState(0);
   const [isChatVisible, setIsChatVisible] = useState(false);
-  const [chatMessages, setChatMessages] = useState(INITIAL_CHAT_MESSAGES);
+  const [chatMessages, setChatMessages] = useState([]);
   const [messageText, setMessageText] = useState('');
   const [showDebugModal, setShowDebugModal] = useState(false);
+  
+  // Real YouTube data
+  const [realYouTubeData, setRealYouTubeData] = useState({
+    likes: 0,
+    dislikes: 0,
+    comments: 0,
+    subscribers: 0,
+    concurrentViewers: 0,
+    totalViews: 0,
+    chatId: null,
+    nextPageToken: null,
+  });
   
   const [streamKey, setStreamKey] = useState('');
   const [streamUrl, setStreamUrl] = useState('');
@@ -281,23 +293,41 @@ const CreateLivestreamScreen = ({ navigation }) => {
           const startTime = Date.now();
           const response = await fetch('https://www.google.com/generate_204', {
             method: 'HEAD',
-            cache: 'no-cache'
+            cache: 'no-cache',
+            timeout: 10000 // 10 second timeout
           });
           const latency = Date.now() - startTime;
           
-          setNetworkStatus(prev => ({
-            ...prev,
-            latency,
-            quality: latency < 100 ? 'Excellent' : latency < 300 ? 'Good' : latency < 500 ? 'Fair' : 'Poor',
-            bandwidth: latency < 100 ? 'High' : latency < 300 ? 'Medium' : 'Low'
-          }));
+          const newQuality = latency < 100 ? 'Excellent' : latency < 300 ? 'Good' : latency < 500 ? 'Fair' : 'Poor';
+          
+          setNetworkStatus(prev => {
+            // If quality degraded significantly, warn user
+            if (prev.quality === 'Excellent' && newQuality === 'Poor') {
+              console.warn('[NETWORK] ⚠️ Network quality degraded significantly - stream may be affected');
+            }
+            
+            return {
+              ...prev,
+              latency,
+              quality: newQuality,
+              bandwidth: latency < 100 ? 'High' : latency < 300 ? 'Medium' : 'Low',
+              lastCheck: new Date().toISOString()
+            };
+          });
         } catch (error) {
-          console.warn('[NETWORK] Network check failed:', error);
+          console.warn('[NETWORK] ❌ Network check failed:', error.message);
           setNetworkStatus(prev => ({
             ...prev,
             quality: 'Poor',
-            bandwidth: 'Unknown'
+            bandwidth: 'Unknown',
+            lastCheck: new Date().toISOString(),
+            error: error.message
           }));
+          
+          // If network is completely down, warn user
+          if (isStreaming) {
+            console.warn('[NETWORK] ⚠️ Network issues detected during streaming - connection may be unstable');
+          }
         }
       }, 5000);
       
@@ -355,62 +385,130 @@ const CreateLivestreamScreen = ({ navigation }) => {
     checkIfRealDevice();
   }, []);
   
-  // Simulate increasing viewcount when live
+  // Real YouTube data fetching when live
   useEffect(() => {
-    let interval;
-    if (isLive) {
-      interval = setInterval(() => {
-        setViewCount(prev => prev + Math.floor(Math.random() * 3));
-      }, 5000);
-    }
-    return () => clearInterval(interval);
-  }, [isLive]);
-  
-  // Generate random chat messages while streaming
-  useEffect(() => {
+    let statsInterval;
     let chatInterval;
-    if (isLive) {
+    let healthCheckInterval;
+    
+    if (isLive && broadcastId) {
+      // Get live chat ID first
+      getLiveChatId();
+      
+      // Fetch real statistics every 10 seconds
+      statsInterval = setInterval(() => {
+        fetchVideoStatistics();
+      }, 10000);
+      
+      // Fetch real chat messages every 5 seconds
       chatInterval = setInterval(() => {
-        const randomMessages = [
-          'This is so interesting!',
-          'Thanks for sharing this.',
-          'Can you explain more?',
-          'Great content!',
-          'Wow, I didn\'t know that!',
-          'How long have you been coding?',
-          'Are you planning to do this again?',
-          'This is exactly what I needed to learn.',
-          'Hello from Germany!',
-          'First time catching your stream!'
-        ];
-        
-        const randomUsernames = [
-          'CodingFan',
-          'ReactLover',
-          'DevStudent',
-          'JSExpert',
-          'MobileDev',
-          'UI_Designer',
-          'WebDeveloper',
-          'CodeNoob',
-          'TechGuru',
-          'AppBuilder'
-        ];
-        
-        const newMessage = {
-          id: Date.now().toString(),
-          username: randomUsernames[Math.floor(Math.random() * randomUsernames.length)],
-          message: randomMessages[Math.floor(Math.random() * randomMessages.length)],
-          avatar: `https://randomuser.me/api/portraits/${Math.random() > 0.5 ? 'men' : 'women'}/${Math.floor(Math.random() * 99)}.jpg`,
-          timestamp: 'just now'
-        };
-        
-        setChatMessages(prevMessages => [newMessage, ...prevMessages.slice(0, 49)]);
-      }, 8000);
+        fetchLiveChatMessages();
+      }, 5000);
+      
+      // Monitor stream health every 30 seconds
+      healthCheckInterval = setInterval(async () => {
+        if (streamData?.id && isStreaming) {
+          try {
+            const status = await checkStreamStatus(streamData.id);
+            console.log('[DEBUG] 🔍 Stream health check:', status);
+            
+            // If YouTube reports no data for too long, try to reconnect
+            if (status.streamStatus === 'active' && !status.hasData) {
+              console.warn('[DEBUG] ⚠️ YouTube reports no data - stream may have issues');
+              
+              // Check if this has been happening for a while
+              const now = Date.now();
+              if (!window.lastDataWarning || (now - window.lastDataWarning) > 60000) {
+                window.lastDataWarning = now;
+                
+                Alert.alert(
+                  'Stream Quality Warning',
+                  'YouTube is not receiving video data from your stream. This might cause your stream to end automatically.\n\nWould you like to restart the connection?',
+                  [
+                    { text: 'Continue', style: 'cancel' },
+                    { 
+                      text: 'Restart Connection', 
+                      onPress: async () => {
+                        console.log('[DEBUG] User chose to restart connection');
+                        try {
+                          await stopLiveStreaming();
+                          setTimeout(async () => {
+                            await startLiveStreaming();
+                          }, 2000);
+                        } catch (error) {
+                          console.error('[DEBUG] Failed to restart connection:', error);
+                        }
+                      }
+                    }
+                  ]
+                );
+              }
+            }
+          } catch (error) {
+            console.warn('[DEBUG] Stream health check failed:', error);
+          }
+        }
+      }, 30000);
+      
+      // Initial fetch
+      fetchVideoStatistics();
+      setTimeout(fetchLiveChatMessages, 2000); // Wait a bit for chat ID
     }
     
-    return () => clearInterval(chatInterval);
-  }, [isLive]);
+    return () => {
+      if (statsInterval) clearInterval(statsInterval);
+      if (chatInterval) clearInterval(chatInterval);
+      if (healthCheckInterval) clearInterval(healthCheckInterval);
+    };
+  }, [isLive, broadcastId, realYouTubeData.chatId, isStreaming, streamData?.id]);
+  
+  // No more fake chat messages - using real YouTube chat only
+  
+  // CRITICAL: Camera cleanup when leaving live/preview screens
+  useEffect(() => {
+    // Only disable camera when going back to setup (not when going from preview to live)
+    if (currentStep === 'setup') {
+      console.log('[PRIVACY] Returned to setup - cleaning up camera resources');
+      setIsCameraOff(true);
+      setIsStreaming(false);
+      
+      // Stop any active streams
+      if (liveStreamRef.current) {
+        try {
+          liveStreamRef.current.stopStreaming();
+        } catch (error) {
+          console.log('[PRIVACY] Error stopping stream during cleanup:', error);
+        }
+      }
+    } else if (currentStep === 'preview' || currentStep === 'live') {
+      // Reset camera state when entering preview or live (unless manually disabled)
+      if (!cameraActiveWhenBackground) {
+        setIsCameraOff(false);
+      }
+    }
+  }, [currentStep]);
+  
+  // CRITICAL: Component unmount cleanup
+  useEffect(() => {
+    return () => {
+      // This runs when the entire component unmounts (user navigates away)
+      console.log('[PRIVACY] Component unmounting - cleaning up all camera resources');
+      
+      // Stop streaming
+      if (liveStreamRef.current) {
+        try {
+          liveStreamRef.current.stopStreaming();
+        } catch (error) {
+          console.log('[PRIVACY] Error stopping stream during unmount:', error);
+        }
+      }
+      
+      // Ensure camera is disabled
+      setIsCameraOff(true);
+      setIsStreaming(false);
+      setIsLive(false);
+    };
+  }, []); // Empty dependency array means this only runs on unmount
   
   // Handle thumbnail selection
   const handleSelectThumbnail = () => {
@@ -616,34 +714,70 @@ const CreateLivestreamScreen = ({ navigation }) => {
 
   // Start actual livestreaming
   const startLiveStreaming = async () => {
+    console.log('[DEBUG] startLiveStreaming function called');
+    
     try {
+      // Comprehensive validation
       if (!streamKey) {
         throw new Error('Stream key is required. Please create a broadcast first or enter a custom stream key.');
       }
 
-      console.log('[LIVESTREAM] Starting RTMP stream with key:', streamKey);
-      console.log('[LIVESTREAM] Using stream URL:', streamUrl);
+      if (!streamUrl) {
+        throw new Error('Stream URL is required. Please create a broadcast first.');
+      }
+
+      console.log('[DEBUG] Starting RTMP stream with key:', streamKey ? 'Present' : 'Missing');
+      console.log('[DEBUG] Using stream URL:', streamUrl);
+      
+      // Wait for the live stream component to be ready with more robust checking
+      let attempts = 0;
+      const maxAttempts = 15; // Increased attempts
+      
+      console.log('[DEBUG] Waiting for ApiVideoLiveStreamView component...');
+      while ((!liveStreamRef.current || !liveStreamRef.current._isReady) && attempts < maxAttempts) {
+        console.log(`[DEBUG] Waiting for live stream component (attempt ${attempts + 1}/${maxAttempts})`);
+        console.log(`[DEBUG] Component exists: ${!!liveStreamRef.current}, Ready: ${!!(liveStreamRef.current && liveStreamRef.current._isReady)}`);
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Increased wait time
+        attempts++;
+      }
+      
+      // Final check for component readiness
+      if (!liveStreamRef.current) {
+        console.error('[DEBUG] ApiVideoLiveStreamView component not available after waiting');
+        throw new Error('Live stream component failed to initialize. Please try again.');
+      }
+      
+      console.log('[DEBUG] ApiVideoLiveStreamView component is ready');
+      
+      // Validate component methods exist
+      if (typeof liveStreamRef.current.startStreaming !== 'function') {
+        console.error('[DEBUG] startStreaming method not available on component');
+        throw new Error('Live stream component is not properly initialized. Please restart the app.');
+      }
+      
+      // Use the exact YouTube RTMP URL provided during stream creation
+      const finalStreamUrl = streamUrl || 'rtmp://a.rtmp.youtube.com/live2';
+      
+      console.log('[DEBUG] Final stream URL:', finalStreamUrl);
+      console.log('[DEBUG] Stream key length:', streamKey.length);
       
       // Start the RTMP livestream using API.video
-      if (liveStreamRef.current) {
-        // Use the exact YouTube RTMP URL provided during stream creation
-        const finalStreamUrl = streamUrl || 'rtmp://a.rtmp.youtube.com/live2';
-        
-        console.log('[LIVESTREAM] Starting stream to:', finalStreamUrl);
-        console.log('[LIVESTREAM] With stream key:', streamKey);
-        
-        // For YouTube RTMP, we need to ensure proper URL format
-        // YouTube expects: rtmp://a.rtmp.youtube.com/live2/STREAM_KEY
-        // But API.video component might handle URL construction differently
-        
-        console.log('[LIVESTREAM] Attempting to start stream with YouTube RTMP');
+      console.log('[DEBUG] Calling startStreaming on ApiVideoLiveStreamView...');
+      
+      try {
         liveStreamRef.current.startStreaming(streamKey, finalStreamUrl);
-        console.log('[LIVESTREAM] RTMP stream command sent successfully');
+        console.log('[DEBUG] startStreaming call completed successfully');
+      } catch (componentError) {
+        console.error('[DEBUG] Error calling startStreaming:', componentError);
+        throw new Error(`Failed to start streaming component: ${componentError.message || componentError}`);
       }
+      
     } catch (error) {
-      console.error('[LIVESTREAM] Error starting stream:', error);
-      setStreamingError(error.message || error);
-      Alert.alert('Streaming Error', error.message || error);
+      console.error('[DEBUG] Error in startLiveStreaming:', error);
+      setStreamingError(error.message || error.toString());
+      
+      // Don't show alert here, let the calling function handle it
+      throw error;
     }
   };
 
@@ -766,21 +900,55 @@ const CreateLivestreamScreen = ({ navigation }) => {
 
   // Go live
   const goLive = async () => {
+    console.log('[DEBUG] goLive function called');
+    
     try {
+      // Comprehensive validation
+      console.log('[DEBUG] Validating required data...');
+      console.log('[DEBUG] streamKey:', streamKey ? 'Present' : 'Missing');
+      console.log('[DEBUG] streamUrl:', streamUrl ? 'Present' : 'Missing');
+      console.log('[DEBUG] broadcastId:', broadcastId ? 'Present' : 'Missing');
+      console.log('[DEBUG] user.accessToken:', user?.accessToken ? 'Present' : 'Missing');
+      
+      if (!streamKey || !streamUrl || !broadcastId) {
+        throw new Error('Missing required stream data. Please go back to setup and try again.');
+      }
+      
+      if (!user?.accessToken) {
+        throw new Error('Authentication token missing. Please sign in again.');
+      }
+      
+      // Check camera permissions before proceeding
+      console.log('[DEBUG] Checking camera permissions...');
+      if (!hasCameraPermission) {
+        throw new Error('Camera permission required. Please enable camera access in Settings.');
+      }
+      
+      if (!hasMicrophonePermission) {
+        throw new Error('Microphone permission required. Please enable microphone access in Settings.');
+      }
+      
       setIsWaitingForStream(true);
       setStreamStatus('connecting');
       
       // First transition to live view to initialize the camera component
-      console.warn('[YouTube API] Transitioning to live view...');
+      console.log('[DEBUG] Transitioning to live view...');
       setCurrentStep('live');
       
       // Give the camera component more time to initialize properly
-      console.warn('[YouTube API] Initializing camera component...');
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      console.log('[DEBUG] Waiting for camera component initialization...');
+      await new Promise(resolve => setTimeout(resolve, 3000)); // Increased wait time
       
       // Now start the RTMP stream
-      console.warn('[YouTube API] Starting RTMP stream...');
-      await startLiveStreaming();
+      console.log('[DEBUG] Starting RTMP stream...');
+      try {
+        await startLiveStreaming();
+        console.log('[DEBUG] RTMP stream started successfully');
+      } catch (streamError) {
+        console.error('[DEBUG] Failed to start streaming:', streamError);
+        setStreamStatus('error');
+        throw new Error(`Failed to start streaming: ${streamError.message}`);
+      }
       
       // Wait longer for the stream to establish and start sending actual video data
       console.warn('[YouTube API] Waiting for stream to establish and send video data...');
@@ -825,30 +993,59 @@ const CreateLivestreamScreen = ({ navigation }) => {
         const data = await response.json();
         console.warn('[YouTube API] Transition response:', JSON.stringify(data, null, 2));
 
-        if (!response.ok) {
-          // Check if it's a "redundant transition" error (meaning already live)
+              if (!response.ok) {
+          // Check if it's a "redundant transition" error (meaning already ended)
           if (data.error?.reason === 'redundantTransition') {
-            console.warn('[YouTube API] Broadcast is already live (redundant transition)');
-            setIsLive(true);
-            setIsWaitingForStream(false);
-            return;
+            console.warn('[DEBUG] ✅ Broadcast already ended (redundant transition) - this is normal');
+            // Stream is already ended, continue with cleanup
+          } else {
+            throw new Error(data.error?.message || 'Failed to end livestream');
           }
-          setStreamStatus('error');
-          throw new Error(data.error?.message || 'Failed to go live');
         }
       }
       
       setIsLive(true);
       setIsWaitingForStream(false);
     } catch (error) {
-      console.warn('[YouTube API] Error going live:', error);
+      console.error('[DEBUG] Error in goLive function:', error);
+      console.error('[DEBUG] Error stack:', error.stack);
+      
+      // Reset all states
       setIsWaitingForStream(false);
       setStreamStatus('error');
-      // Don't go back to preview if we're already in live view
-      if (currentStep !== 'live') {
-        setCurrentStep('preview');
-      }
-      Alert.alert('Error', error.message || 'Failed to go live');
+      setIsStreaming(false);
+      setStreamingError(error.message || error.toString());
+      
+      // Go back to preview on error to allow retry
+      setCurrentStep('preview');
+      
+      // Show detailed error information
+      const errorMessage = error.message || error.toString() || 'Unknown error occurred';
+      console.error('[DEBUG] Showing error alert:', errorMessage);
+      
+      Alert.alert(
+        'Streaming Error', 
+        `Failed to start streaming:\n\n${errorMessage}\n\nPlease check your internet connection and try again.`,
+        [
+          { 
+            text: 'Retry', 
+            onPress: () => {
+              console.log('[DEBUG] User chose to retry');
+              // Reset error state
+              setStreamingError(null);
+              setStreamStatus('inactive');
+            }
+          },
+          { 
+            text: 'Go Back', 
+            style: 'cancel',
+            onPress: () => {
+              console.log('[DEBUG] User chose to go back to setup');
+              setCurrentStep('setup');
+            }
+          }
+        ]
+      );
     }
   };
 
@@ -873,16 +1070,237 @@ const CreateLivestreamScreen = ({ navigation }) => {
     }
   };
 
-  // Toggle microphone
+  // Toggle microphone - use mute instead of stopping audio stream
   const toggleMicrophone = () => {
-    setIsMicMuted(!isMicMuted);
-    console.log('[AUDIO] Microphone', isMicMuted ? 'unmuted' : 'muted');
+    const newMuteState = !isMicMuted;
+    setIsMicMuted(newMuteState);
+    
+    console.log('[DEBUG] 🎤 Microphone toggle:', newMuteState ? 'MUTED' : 'UNMUTED');
+    console.log('[DEBUG] ✅ Audio stream continues - just muted/unmuted');
+    
+    // The ApiVideoLiveStreamView handles muting internally via the isMuted prop
+    // This ensures audio stream continuity to YouTube
   };
 
-  // Toggle camera
-  const toggleCamera = () => {
-    setIsCameraOff(!isCameraOff);
-    console.log('[VIDEO] Camera', isCameraOff ? 'enabled' : 'disabled');
+  // Toggle camera - restart stream with different camera settings
+  const toggleCamera = async () => {
+    const newCameraState = !isCameraOff;
+    setIsCameraOff(newCameraState);
+    
+    console.log('[DEBUG] 📹 Camera toggle:', newCameraState ? 'OFF (no camera to YouTube)' : 'ON (live feed to YouTube)');
+    
+    // If we're currently streaming, we need to restart the stream with new settings
+    if (isStreaming && liveStreamRef.current && streamKey && streamUrl) {
+      try {
+        console.log('[DEBUG] 🔄 Restarting stream with new camera settings...');
+        
+        // Stop current stream
+        await liveStreamRef.current.stopStreaming();
+        setIsStreaming(false);
+        
+        // Wait a moment for cleanup
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        // Restart stream - the component will use the new isCameraOff state
+        liveStreamRef.current.startStreaming(streamKey, streamUrl);
+        
+        console.log('[DEBUG] ✅ Stream restarted with camera', newCameraState ? 'OFF' : 'ON');
+      } catch (error) {
+        console.error('[DEBUG] Error restarting stream:', error);
+        // If restart fails, at least update the UI
+      }
+    }
+  };
+
+  // Fetch real YouTube live chat messages
+  const fetchLiveChatMessages = async () => {
+    if (!realYouTubeData.chatId) return;
+    
+    try {
+      const url = `https://www.googleapis.com/youtube/v3/liveChat/messages?liveChatId=${realYouTubeData.chatId}&part=snippet,authorDetails&maxResults=200${realYouTubeData.nextPageToken ? `&pageToken=${realYouTubeData.nextPageToken}` : ''}`;
+      
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${user.accessToken}`,
+        },
+      });
+
+      const data = await response.json();
+      console.log('[REAL CHAT] Fetched messages:', data);
+
+      if (response.ok && data.items) {
+        const newMessages = data.items.map(item => ({
+          id: item.id,
+          username: item.authorDetails.displayName,
+          message: item.snippet.displayMessage,
+          avatar: item.authorDetails.profileImageUrl,
+          timestamp: new Date(item.snippet.publishedAt).toLocaleTimeString(),
+          publishedAt: item.snippet.publishedAt, // Keep original timestamp for deduplication
+          isHost: item.authorDetails.isChatOwner,
+          isModerator: item.authorDetails.isChatModerator,
+          isVerified: item.authorDetails.isVerified,
+        }));
+
+        // Deduplicate messages by ID and timestamp
+        setChatMessages(prev => {
+          const existingIds = new Set(prev.map(msg => msg.id));
+          const existingTimestamps = new Set(prev.map(msg => msg.publishedAt));
+          
+          const uniqueNewMessages = newMessages.filter(msg => 
+            !existingIds.has(msg.id) && !existingTimestamps.has(msg.publishedAt)
+          );
+          
+          console.log(`[REAL CHAT] Fetched ${data.items.length} messages, ${uniqueNewMessages.length} are new`);
+          
+          // Add only unique new messages to the beginning (most recent first)
+          // Limit to 100 messages to prevent performance issues
+          const updatedMessages = [...uniqueNewMessages.reverse(), ...prev];
+          return updatedMessages.slice(0, 100);
+        });
+        
+        // Update next page token for pagination
+        setRealYouTubeData(prev => ({
+          ...prev,
+          nextPageToken: data.nextPageToken
+        }));
+      }
+    } catch (error) {
+      console.error('[REAL CHAT] Error fetching chat messages:', error);
+    }
+  };
+
+  // Fetch real YouTube video statistics
+  const fetchVideoStatistics = async () => {
+    if (!broadcastId) return;
+    
+    try {
+      const response = await fetch(
+        `https://www.googleapis.com/youtube/v3/videos?part=statistics,liveStreamingDetails&id=${broadcastId}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${user.accessToken}`,
+          },
+        }
+      );
+
+      const data = await response.json();
+      console.log('[REAL STATS] Video statistics:', data);
+
+      if (response.ok && data.items && data.items.length > 0) {
+        const stats = data.items[0].statistics;
+        const liveDetails = data.items[0].liveStreamingDetails;
+        
+        setRealYouTubeData(prev => ({
+          ...prev,
+          likes: parseInt(stats.likeCount || 0),
+          comments: parseInt(stats.commentCount || 0),
+          totalViews: parseInt(stats.viewCount || 0),
+          concurrentViewers: parseInt(liveDetails?.concurrentViewers || 0),
+        }));
+        
+        // Update the main view count with real data
+        setViewCount(parseInt(liveDetails?.concurrentViewers || 0));
+      }
+    } catch (error) {
+      console.error('[REAL STATS] Error fetching video statistics:', error);
+    }
+  };
+
+  // Get live chat ID from broadcast
+  const getLiveChatId = async () => {
+    if (!broadcastId) return;
+    
+    try {
+      const response = await fetch(
+        `https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id=${broadcastId}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${user.accessToken}`,
+          },
+        }
+      );
+
+      const data = await response.json();
+      console.log('[REAL CHAT] Live chat details:', data);
+
+      if (response.ok && data.items && data.items.length > 0) {
+        const chatId = data.items[0].liveStreamingDetails?.activeLiveChatId;
+        if (chatId) {
+          setRealYouTubeData(prev => ({
+            ...prev,
+            chatId: chatId
+          }));
+          console.log('[REAL CHAT] Found live chat ID:', chatId);
+        }
+      }
+    } catch (error) {
+      console.error('[REAL CHAT] Error getting live chat ID:', error);
+    }
+  };
+
+  // Send message to real YouTube live chat
+  const sendChatMessage = async (message) => {
+    if (!realYouTubeData.chatId || !message.trim()) return;
+    
+    try {
+      const response = await fetch(
+        'https://www.googleapis.com/youtube/v3/liveChat/messages?part=snippet',
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${user.accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            snippet: {
+              liveChatId: realYouTubeData.chatId,
+              type: 'textMessageEvent',
+              textMessageDetails: {
+                messageText: message
+              }
+            }
+          }),
+        }
+      );
+
+      const data = await response.json();
+      console.log('[REAL CHAT] Message sent:', data);
+
+      if (response.ok) {
+        // Message sent successfully, it will appear in the next fetch
+        setMessageText('');
+        
+        // Add a temporary message immediately for better UX (will be replaced by real message from API)
+        const tempMessage = {
+          id: `temp_${Date.now()}`, // Temporary ID
+          username: user.name || 'You',
+          message: message,
+          avatar: user.picture || 'https://via.placeholder.com/36',
+          timestamp: new Date().toLocaleTimeString(),
+          publishedAt: new Date().toISOString(),
+          isHost: true,
+          isModerator: false,
+          isVerified: false,
+          isTemporary: true, // Mark as temporary
+        };
+        
+        setChatMessages(prev => [tempMessage, ...prev]);
+        
+        // Fetch new messages after a delay to get the real message and remove temp
+        setTimeout(() => {
+          fetchLiveChatMessages();
+          // Remove temporary message after real one should have arrived
+          setTimeout(() => {
+            setChatMessages(prev => prev.filter(msg => !msg.isTemporary));
+          }, 2000);
+        }, 1000);
+      } else {
+        Alert.alert('Chat Error', data.error?.message || 'Failed to send message');
+      }
+    } catch (error) {
+      console.error('[REAL CHAT] Error sending message:', error);
+      Alert.alert('Chat Error', 'Failed to send message');
+    }
   };
 
   // Enhanced end stream with privacy protection
@@ -922,6 +1340,9 @@ const CreateLivestreamScreen = ({ navigation }) => {
                 throw new Error(data.error?.message || 'Failed to end livestream');
               }
 
+              // CRITICAL: Immediately disable camera for privacy
+              setIsCameraOff(true);
+              
               // Reset all streaming states
               setIsLive(false);
               setIsStreaming(false);
@@ -936,6 +1357,9 @@ const CreateLivestreamScreen = ({ navigation }) => {
                 fps: 30,
                 bitrate: 0,
               });
+              
+              // CRITICAL: Go back to setup to unmount camera components
+              setCurrentStep('setup');
               
               // Show stream summary
               const duration = Math.floor(streamStats.duration / 60);
@@ -1150,16 +1574,22 @@ const CreateLivestreamScreen = ({ navigation }) => {
 
     return (
       <View style={styles.previewContainer}>
-        <Camera
-          ref={cameraRef}
-          style={StyleSheet.absoluteFill}
-          device={selectedDevice}
-          isActive={currentStep === 'preview' || currentStep === 'live'}
-          photo={true}
-          video={true}
-          audio={true}
-          torch={flash === 'on' ? 'on' : 'off'}
-        />
+        {!isCameraOff ? (
+          <Camera
+            ref={cameraRef}
+            style={StyleSheet.absoluteFill}
+            device={selectedDevice}
+            isActive={currentStep === 'preview'}
+            photo={true}
+            video={true}
+            audio={!isMicMuted}
+            torch={flash === 'on' ? 'on' : 'off'}
+          />
+        ) : (
+          <View style={[StyleSheet.absoluteFill, styles.cameraOff]}>
+            <Text style={styles.cameraOffText}>Camera Disabled</Text>
+          </View>
+        )}
         {/* Camera controls */}
         <View style={styles.controlsContainer}>
           <TouchableOpacity
@@ -1221,16 +1651,36 @@ const CreateLivestreamScreen = ({ navigation }) => {
     );
   };
   
-  // Render chat message item
+  // Render chat message item with real YouTube data
   const renderChatMessage = ({ item }) => (
-    <View style={[styles.chatMessage, item.isHost && styles.hostChatMessage]}>
+    <View style={[
+      styles.chatMessage, 
+      item.isHost && styles.hostChatMessage,
+      item.isModerator && styles.moderatorChatMessage,
+      item.isTemporary && styles.temporaryChatMessage
+    ]}>
       <Image source={{ uri: item.avatar }} style={styles.chatAvatar} />
       <View style={styles.chatContent}>
         <View style={styles.chatHeader}>
-          <Text style={[styles.chatUsername, item.isHost && styles.hostUsername]}>{item.username}</Text>
+          <View style={styles.usernameContainer}>
+            <Text style={[
+              styles.chatUsername, 
+              item.isHost && styles.hostUsername,
+              item.isModerator && styles.moderatorUsername,
+              item.isTemporary && styles.temporaryUsername
+            ]}>
+              {item.username}
+            </Text>
+            {item.isVerified && <Text style={styles.verifiedBadge}>✓</Text>}
+            {item.isModerator && <Text style={styles.moderatorBadge}>🛡️</Text>}
+            {item.isHost && <Text style={styles.hostBadge}>👑</Text>}
+            {item.isTemporary && <Text style={styles.sendingBadge}>📤</Text>}
+          </View>
           <Text style={styles.chatTimestamp}>{item.timestamp}</Text>
         </View>
-        <Text style={styles.chatText}>{item.message}</Text>
+        <Text style={[styles.chatText, item.isTemporary && styles.temporaryChatText]}>
+          {item.message}
+        </Text>
       </View>
     </View>
   );
@@ -1263,12 +1713,21 @@ const CreateLivestreamScreen = ({ navigation }) => {
             </View>
             
             <View style={styles.debugSection}>
+              <Text style={styles.debugSectionTitle}>📊 Real YouTube Analytics</Text>
+              <Text style={styles.debugItem}>Live Viewers: {realYouTubeData.concurrentViewers}</Text>
+              <Text style={styles.debugItem}>Total Views: {realYouTubeData.totalViews}</Text>
+              <Text style={styles.debugItem}>Likes: {realYouTubeData.likes}</Text>
+              <Text style={styles.debugItem}>Comments: {realYouTubeData.comments}</Text>
+              <Text style={styles.debugItem}>Chat ID: {realYouTubeData.chatId ? '✅ Connected' : '❌ Not found'}</Text>
+              <Text style={styles.debugItem}>Chat Messages: {chatMessages.length}</Text>
+            </View>
+            
+            <View style={styles.debugSection}>
               <Text style={styles.debugSectionTitle}>📊 Stream Performance</Text>
               <Text style={styles.debugItem}>Duration: {Math.floor(streamStats.duration / 60)}:{(streamStats.duration % 60).toString().padStart(2, '0')}</Text>
               <Text style={styles.debugItem}>Current FPS: {streamStats.fps}</Text>
               <Text style={styles.debugItem}>Dropped Frames: {streamStats.droppedFrames}</Text>
               <Text style={styles.debugItem}>Current Bitrate: {Math.round(streamStats.bitrate/1000)}k</Text>
-              <Text style={styles.debugItem}>Viewers: {viewCount}</Text>
             </View>
             
             <View style={styles.debugSection}>
@@ -1336,6 +1795,9 @@ const CreateLivestreamScreen = ({ navigation }) => {
               <Text style={styles.debugItem}>Waiting for Stream: {isWaitingForStream ? 'Yes' : 'No'}</Text>
               <Text style={styles.debugItem}>Stream Error: {streamingError || 'None'}</Text>
               <Text style={styles.debugItem}>Viewer Count: {viewCount}</Text>
+              <Text style={styles.debugItem}>Camera State: {isCameraOff ? '📹 OFF (Placeholder Active)' : '📹 ON (Live Feed)'}</Text>
+              <Text style={styles.debugItem}>Microphone: {isMicMuted ? '🎤 MUTED' : '🎤 ACTIVE'}</Text>
+              <Text style={styles.debugItem}>Stream Continuity: {isStreaming ? '✅ MAINTAINED' : '❌ INTERRUPTED'}</Text>
             </View>
             
             <View style={styles.debugSection}>
@@ -1393,16 +1855,7 @@ const CreateLivestreamScreen = ({ navigation }) => {
               returnKeyType="send"
               onSubmitEditing={() => {
                 if (messageText.trim() !== '') {
-                  const newMessage = {
-                    id: Date.now().toString(),
-                    username: 'You (Host)',
-                    message: messageText,
-                    avatar: 'https://randomuser.me/api/portraits/men/85.jpg',
-                    timestamp: 'just now',
-                    isHost: true
-                  };
-                  setChatMessages(prev => [newMessage, ...prev]);
-                  setMessageText('');
+                  sendChatMessage(messageText);
                 }
               }}
             />
@@ -1410,16 +1863,7 @@ const CreateLivestreamScreen = ({ navigation }) => {
               style={styles.sendButton} 
               onPress={() => {
                 if (messageText.trim() !== '') {
-                  const newMessage = {
-                    id: Date.now().toString(),
-                    username: 'You (Host)',
-                    message: messageText,
-                    avatar: 'https://randomuser.me/api/portraits/men/85.jpg',
-                    timestamp: 'just now',
-                    isHost: true
-                  };
-                  setChatMessages(prev => [newMessage, ...prev]);
-                  setMessageText('');
+                  sendChatMessage(messageText);
                 }
               }}
               disabled={messageText.trim() === ''}
@@ -1458,6 +1902,10 @@ const CreateLivestreamScreen = ({ navigation }) => {
             </View>
             
             <Text style={styles.viewerCount}>{viewCount} watching</Text>
+            <View style={styles.engagementStats}>
+              <Text style={styles.engagementText}>👍 {realYouTubeData.likes}</Text>
+              <Text style={styles.engagementText}>💬 {realYouTubeData.comments}</Text>
+            </View>
           </View>
           
           {/* Network Status Display for Simulator */}
@@ -1563,52 +2011,65 @@ const CreateLivestreamScreen = ({ navigation }) => {
     
     return (
       <View style={styles.liveContainer}>
-        <ApiVideoLiveStreamView
-          ref={liveStreamRef}
-          style={[styles.camera, isCameraOff && styles.cameraOff]}
-          camera={isCameraOff ? null : (isFrontCamera ? 'front' : 'back')}
-          enablePinchedZoom={true}
-          video={{
-            fps: 30,
-            resolution: streamQuality,
-            bitrate: streamBitrate * 1000, // Convert kbps to bps (YouTube expects this format)
-            gopDuration: 2, // YouTube recommends 2-4 seconds for GOP duration
-          }}
-          audio={{
-            bitrate: 128000, // 128 kbps is good for YouTube
-            sampleRate: 44100, // Standard sample rate
-            isStereo: true,
-          }}
-          isMuted={isMicMuted}
-          onConnectionSuccess={() => {
-            console.log('[LIVESTREAM] Stream connected successfully to YouTube RTMP');
-            console.log('[LIVESTREAM] Stream URL:', streamUrl);
-            console.log('[LIVESTREAM] Stream Key:', streamKey ? 'Present' : 'Missing');
-            setIsStreaming(true);
-            setStreamingError(null);
+                        {currentStep === 'live' ? (
+          <View style={styles.camera}>
+            <ApiVideoLiveStreamView
+              ref={liveStreamRef}
+              style={StyleSheet.absoluteFill}
+              camera={isCameraOff ? null : (isFrontCamera ? 'front' : 'back')}
+              enablePinchedZoom={!isCameraOff}
+              video={{
+                fps: 30,
+                resolution: streamQuality,
+                bitrate: streamBitrate * 1000,
+                gopDuration: 2,
+              }}
+              audio={{
+                bitrate: 128000,
+                sampleRate: 44100,
+                isStereo: true,
+              }}
+              isMuted={isMicMuted}
+              onReady={() => {
+                console.log('[DEBUG] ApiVideoLiveStreamView component is ready');
+                if (liveStreamRef.current) {
+                  liveStreamRef.current._isReady = true;
+                }
+              }}
+              onConnectionSuccess={() => {
+                console.log('[DEBUG] ✅ RTMP Stream connected successfully to YouTube');
+                setIsStreaming(true);
+                setStreamingError(null);
+                setStreamStatus('active');
+              }}
+              onConnectionFailed={(error) => {
+                console.error('[DEBUG] ❌ RTMP Connection failed:', error);
+                setStreamingError(`Connection failed: ${error}`);
+                setIsStreaming(false);
+                setStreamStatus('error');
+              }}
+              onDisconnect={() => {
+                console.warn('[DEBUG] ⚠️ RTMP Stream disconnected unexpectedly');
+                setIsStreaming(false);
+                setStreamStatus('disconnected');
+              }}
+            />
             
-            // Start monitoring stream status after connection
-            setTimeout(() => {
-              if (streamData?.id) {
-                checkStreamStatus(streamData.id).then(status => {
-                  console.log('[LIVESTREAM] Post-connection stream status:', status);
-                });
-              }
-            }, 5000);
-          }}
-          onConnectionFailed={(error) => {
-            console.error('[LIVESTREAM] Connection failed to YouTube RTMP:', error);
-            console.error('[LIVESTREAM] Stream URL was:', streamUrl);
-            console.error('[LIVESTREAM] Stream Key present:', streamKey ? 'Yes' : 'No');
-            setStreamingError(error);
-            setIsStreaming(false);
-            Alert.alert('Connection Failed', 'Failed to connect to YouTube RTMP server: ' + error);
-          }}
-          onDisconnect={() => {
-            console.log('[LIVESTREAM] Stream disconnected from YouTube RTMP');
-            setIsStreaming(false);
-          }}
-        />
+            {isCameraOff && (
+              <View style={[StyleSheet.absoluteFill, styles.placeholderOverlay]}>
+                <View style={styles.placeholderContent}>
+                  <MaterialIcons name="videocam-off" size={120} color="#FFFFFF" />
+                  <Text style={styles.placeholderTitle}>Be Right Back</Text>
+                  <Text style={styles.placeholderSubtitle}>The host will return shortly</Text>
+                  <View style={styles.placeholderIndicator}>
+                    <View style={styles.liveDot} />
+                    <Text style={styles.placeholderLiveText}>LIVE</Text>
+                  </View>
+                </View>
+              </View>
+            )}
+          </View>
+        ) : null}
         
         <View style={styles.liveHeader}>
           <View style={styles.liveIndicator}>
@@ -1618,6 +2079,10 @@ const CreateLivestreamScreen = ({ navigation }) => {
           
           <View style={styles.streamInfo}>
             <Text style={styles.viewerCount}>{viewCount} watching</Text>
+            <View style={styles.engagementStats}>
+              <Text style={styles.engagementText}>👍 {realYouTubeData.likes}</Text>
+              <Text style={styles.engagementText}>💬 {realYouTubeData.comments}</Text>
+            </View>
             <Text style={styles.streamQualityText}>{streamQuality}</Text>
             {streamingError && (
               <Text style={styles.streamError}>⚠️ {streamingError}</Text>
@@ -2554,6 +3019,142 @@ const styles = StyleSheet.create({
   },
   debugQualityButtonTextActive: {
     color: '#FFFFFF',
+  },
+  engagementStats: {
+    flexDirection: 'row',
+    marginTop: 4,
+  },
+  engagementText: {
+    color: 'white',
+    fontSize: 12,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    paddingVertical: 2,
+    paddingHorizontal: 6,
+    borderRadius: 4,
+    marginRight: 8,
+    fontWeight: '500',
+  },
+  moderatorChatMessage: {
+    backgroundColor: '#444',
+    borderLeftWidth: 3,
+    borderLeftColor: '#4CAF50',
+  },
+  usernameContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  moderatorUsername: {
+    color: '#4CAF50',
+    fontWeight: 'bold',
+  },
+  verifiedBadge: {
+    color: '#1DA1F2',
+    fontSize: 12,
+    marginLeft: 4,
+  },
+  moderatorBadge: {
+    fontSize: 12,
+    marginLeft: 4,
+  },
+  hostBadge: {
+    fontSize: 12,
+    marginLeft: 4,
+  },
+  cameraOffText: {
+    color: '#FFFFFF',
+    fontSize: 18,
+    fontWeight: 'bold',
+    textAlign: 'center',
+    position: 'absolute',
+    top: '50%',
+    left: 0,
+    right: 0,
+  },
+  placeholderOverlay: {
+    backgroundColor: 'rgba(0, 0, 0, 0.9)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  placeholderContent: {
+    alignItems: 'center',
+    padding: 40,
+  },
+  placeholderTitle: {
+    color: '#FFFFFF',
+    fontSize: 32,
+    fontWeight: 'bold',
+    marginTop: 20,
+    textAlign: 'center',
+  },
+  placeholderSubtitle: {
+    color: '#CCCCCC',
+    fontSize: 16,
+    marginTop: 8,
+    textAlign: 'center',
+  },
+  placeholderIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FF0000',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 4,
+    marginTop: 20,
+  },
+  placeholderLiveText: {
+    color: '#FFFFFF',
+    fontWeight: 'bold',
+    fontSize: 12,
+    marginLeft: 6,
+  },
+  placeholderStreamView: {
+    backgroundColor: '#1a1a1a',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  hiddenStream: {
+    position: 'absolute',
+    top: -1000,
+    left: -1000,
+    width: 1,
+    height: 1,
+  },
+  loadingDots: {
+    flexDirection: 'row',
+    marginTop: 20,
+  },
+  dot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#FFFFFF',
+    marginHorizontal: 4,
+  },
+  dot1: {
+    opacity: 0.3,
+  },
+  dot2: {
+    opacity: 0.6,
+  },
+  dot3: {
+    opacity: 1,
+  },
+  temporaryChatMessage: {
+    opacity: 0.7,
+    borderLeftWidth: 2,
+    borderLeftColor: '#FFA500',
+  },
+  temporaryUsername: {
+    color: '#FFA500',
+    fontStyle: 'italic',
+  },
+  temporaryChatText: {
+    color: '#DDD',
+    fontStyle: 'italic',
+  },
+  sendingBadge: {
+    fontSize: 12,
+    marginLeft: 4,
   },
 });
 
